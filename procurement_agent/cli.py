@@ -9,6 +9,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from .database import initialize_database
 from .factory import create_procurement_app
 
 
@@ -18,8 +19,18 @@ def _print(value: Any) -> None:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="企业采购决策与执行 Multi-Agent")
-    parser.add_argument("--data-dir", type=Path, default=None, help="数据库、Checkpoint 与 Trace 目录")
-    parser.add_argument("--without-mcp", action="store_true", help="仅用于隔离诊断；正常运行应启用 MCP")
+    parser.add_argument(
+        "--data-dir", type=Path, default=None, help="数据库、Checkpoint 与 Trace 目录"
+    )
+    parser.add_argument(
+        "--without-mcp", action="store_true", help="仅用于隔离诊断；正常运行应启用 MCP"
+    )
+    parser.add_argument("--model", default=None, help="正式运行使用的 LangChain 模型标识")
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="显式使用离线测试模型；不得用于正式采购决策",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     initialize = subparsers.add_parser("init-db", help="初始化或重置模拟业务数据库")
@@ -51,15 +62,38 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    app = create_procurement_app(
-        data_dir=args.data_dir,
-        reset_database=args.command == "init-db" and args.reset,
-        enable_mcp=not args.without_mcp,
-    )
+    if args.command == "eval":
+        from .evaluation import run_evaluation
+
+        try:
+            _print(run_evaluation(limit=args.limit).as_dict())
+            return 0
+        except Exception as exc:  # noqa: BLE001 - CLI owns the final error boundary
+            _print({"status": "error", "error_type": type(exc).__name__, "message": str(exc)})
+            return 1
+    if args.command == "init-db":
+        try:
+            root = (
+                args.data_dir.resolve()
+                if args.data_dir
+                else Path(__file__).resolve().parents[1] / "data"
+            )
+            initialize_database(root / "procurement.sqlite", reset=args.reset)
+            _print({"status": "initialized", "data_dir": str(root)})
+            return 0
+        except Exception as exc:  # noqa: BLE001 - CLI owns the final error boundary
+            _print({"status": "error", "error_type": type(exc).__name__, "message": str(exc)})
+            return 1
+
+    app = None
     try:
-        if args.command == "init-db":
-            _print({"status": "initialized", "data_dir": str(args.data_dir or "data")})
-        elif args.command == "request":
+        app = create_procurement_app(
+            data_dir=args.data_dir,
+            enable_mcp=not args.without_mcp,
+            model=args.model,
+            deterministic=args.deterministic,
+        )
+        if args.command == "request":
             _print(app.submit(args.text, session_id=args.session).as_dict())
         elif args.command == "approve":
             _print(app.approve(args.session).as_dict())
@@ -78,12 +112,6 @@ def main(argv: list[str] | None = None) -> int:
                 _print(app.approve(session).as_dict())
         elif args.command == "metrics":
             _print(app.metrics())
-        elif args.command == "eval":
-            from .evaluation import run_evaluation
-
-            app.close()
-            app = None
-            _print(run_evaluation(limit=args.limit).as_dict())
         return 0
     except Exception as exc:  # noqa: BLE001 - CLI owns the final stable error boundary
         _print({"status": "error", "error_type": type(exc).__name__, "message": str(exc)})

@@ -60,7 +60,11 @@ def _tool_value(message: ToolMessage) -> Any:
     parsed = _parse(message.content)
     if isinstance(parsed, dict) and {"content", "status"}.issubset(parsed):
         if parsed.get("status") == "error":
-            return {"status": "error", "error": parsed.get("error"), "content": parsed.get("content")}
+            return {
+                "status": "error",
+                "error": parsed.get("error"),
+                "content": parsed.get("content"),
+            }
         return _parse(parsed.get("content"))
     return parsed
 
@@ -91,8 +95,8 @@ def _call(name: str, args: dict[str, Any]) -> AIMessage:
     )
 
 
-class ProcurementChatModel(BaseChatModel):
-    """Role-aware model used to make the sample fully deterministic and testable."""
+class DeterministicProcurementModel(BaseChatModel):
+    """Explicit test double; production composition never selects it implicitly."""
 
     role: str
     bound_tool_names: list[str] = Field(default_factory=list, exclude=True)
@@ -111,7 +115,7 @@ class ProcurementChatModel(BaseChatModel):
         *,
         tool_choice: str | None = None,
         **kwargs: Any,
-    ) -> ProcurementChatModel:
+    ) -> DeterministicProcurementModel:
         self.bound_tool_names = [getattr(tool, "name", str(tool)) for tool in tools]
         return self
 
@@ -165,12 +169,20 @@ class ProcurementChatModel(BaseChatModel):
             argument_name = "plan_json" if self.role == "execution" else "task"
             return _call(primary, {argument_name: task})
 
-        if self.role == "supplier" and len(tool_messages) == 1 and "supplier_status" in self.bound_tool_names:
+        if (
+            self.role == "supplier"
+            and len(tool_messages) == 1
+            and "supplier_status" in self.bound_tool_names
+        ):
             analysis = _tool_value(tool_messages[0])
-            candidates = analysis.get("candidate_suppliers", []) if isinstance(analysis, dict) else []
+            candidates = (
+                analysis.get("candidate_suppliers", []) if isinstance(analysis, dict) else []
+            )
             force_failure = False
             try:
-                force_failure = bool(json.loads(task).get("request", {}).get("simulate_mcp_failure"))
+                force_failure = bool(
+                    json.loads(task).get("request", {}).get("simulate_mcp_failure")
+                )
             except (json.JSONDecodeError, AttributeError):
                 pass
             return _call(
@@ -187,7 +199,9 @@ class ProcurementChatModel(BaseChatModel):
             if not isinstance(analysis, dict):
                 analysis = {"status": "error", "error": str(analysis)}
             if isinstance(external, str) and "error" in external.casefold():
-                analysis.setdefault("warnings", []).append("MCP供应商状态服务失败，使用数据库状态降级")
+                analysis.setdefault("warnings", []).append(
+                    "MCP供应商状态服务失败，使用数据库状态降级"
+                )
                 analysis["external_status"] = {}
                 analysis["mcp_status"] = "fallback"
             else:
@@ -260,8 +274,38 @@ class ProcurementChatModel(BaseChatModel):
                     "budget_analysis": "budget_agent",
                     "risk_analysis": "risk_agent",
                 }[role]
+                if role == "pricing_analysis" and "交期" in str(
+                    current[role].get("conclusion", "")
+                ):
+                    if combined.get("supplier_analysis", {}).get("analysis_strategy") != (
+                        "delivery_first"
+                    ):
+                        return self._delegate(
+                            "supplier_analysis",
+                            combined,
+                            analysis_strategy="delivery_first",
+                            replan_reason="delivery_deadline_unmet",
+                            replan_start=True,
+                        )
+                    return self._delegate(
+                        "pricing_analysis",
+                        combined,
+                        analysis_strategy="delivery_recovery",
+                        replan_reason="delivery_deadline_unmet",
+                    )
                 if current_counts.get(agent_name, 0) < 2:
-                    return self._delegate(role, combined)
+                    error = current[role].get("error")
+                    database_failure = (
+                        "database" in str(error).casefold() or "table" in str(error).casefold()
+                    )
+                    strategy = "schema_recovery" if database_failure else "fallback_recovery"
+                    return self._delegate(
+                        role,
+                        combined,
+                        analysis_strategy=strategy,
+                        replan_reason="data_or_subagent_failure",
+                        replan_start=True,
+                    )
                 result = self._assemble(combined, approval="not_required", execution="blocked")
                 result["replan_count"] = 1
                 result["warnings"].append(f"{agent_name}重试后仍失败")
@@ -279,19 +323,51 @@ class ProcurementChatModel(BaseChatModel):
         ]
         if not risk.get("recommended_plan") and initial_full_route:
             risk_count = current_counts.get("risk_agent", 0)
-            if current_counts.get("supplier_agent", 0) > current_counts.get("pricing_agent", 0):
+            supplier_strategy = str(
+                combined.get("supplier_analysis", {}).get("analysis_strategy") or "standard"
+            )
+            pricing_strategy = str(
+                combined.get("pricing_analysis", {}).get("analysis_strategy") or "standard"
+            )
+            budget_strategy = str(
+                combined.get("budget_analysis", {}).get("analysis_strategy") or "standard"
+            )
+            risk_strategy = str(
+                combined.get("risk_analysis", {}).get("analysis_strategy") or "standard"
+            )
+            supplier_replan_in_progress = supplier_strategy not in {"standard", "balanced"}
+            replan_in_progress = pricing_strategy not in {"standard", "balanced"}
+            if supplier_replan_in_progress and not replan_in_progress:
                 return self._delegate("pricing_analysis", combined)
-            if current_counts.get("pricing_agent", 0) > current_counts.get("budget_agent", 0):
-                return self._delegate("budget_analysis", combined)
-            if current_counts.get("budget_agent", 0) > current_counts.get("risk_agent", 0):
-                return self._delegate("risk_analysis", combined)
-            if risk_count == 1:
+            if replan_in_progress:
+                downstream_strategy = f"revalidate_{pricing_strategy}"
+                if budget_strategy != downstream_strategy:
+                    return self._delegate("budget_analysis", combined)
+                if risk_strategy != downstream_strategy:
+                    return self._delegate("risk_analysis", combined)
+            elif risk_count == 1:
                 reason = risk.get("replan_reason")
-                replan_role = "supplier_analysis" if reason in {
-                    "delivery_deadline_unmet",
-                    "supplier_risk_too_high",
-                } else "pricing_analysis"
-                return self._delegate(replan_role, {**combined, "replan_reason": reason})
+                replan_role = (
+                    "supplier_analysis"
+                    if reason
+                    in {
+                        "delivery_deadline_unmet",
+                        "supplier_risk_too_high",
+                    }
+                    else "pricing_analysis"
+                )
+                strategy = {
+                    "all_suppliers_over_budget": "cost_reduction",
+                    "delivery_deadline_unmet": "delivery_first",
+                    "supplier_risk_too_high": "risk_first",
+                }.get(str(reason), "fallback_recovery")
+                return self._delegate(
+                    replan_role,
+                    {**combined, "replan_reason": reason},
+                    analysis_strategy=strategy,
+                    replan_reason=reason,
+                    replan_start=True,
+                )
 
         if not risk.get("recommended_plan"):
             result = self._assemble(combined, approval="not_required", execution="blocked")
@@ -337,7 +413,11 @@ class ProcurementChatModel(BaseChatModel):
         ]
         if not has_previous:
             return full
-        if "方案" in text and any(word in text for word in ("采用", "选择", "第二", "第一", "第三")):
+        if re.search(r"\d+\s*(?:台|件|个|套)", text):
+            return full
+        if "方案" in text and any(
+            word in text for word in ("采用", "选择", "第二", "第一", "第三")
+        ):
             return ["risk_analysis"]
         if "预算" in text and not re.search(r"\d+\s*(?:台|件|个|套)", text):
             return ["budget_analysis", "risk_analysis"]
@@ -365,7 +445,14 @@ class ProcurementChatModel(BaseChatModel):
         return counts
 
     @staticmethod
-    def _delegate(role: str, combined: dict[str, Any]) -> AIMessage:
+    def _delegate(
+        role: str,
+        combined: dict[str, Any],
+        *,
+        analysis_strategy: str | None = None,
+        replan_reason: str | None = None,
+        replan_start: bool = False,
+    ) -> AIMessage:
         names = {
             "inventory_analysis": "inventory_agent",
             "supplier_analysis": "supplier_agent",
@@ -373,6 +460,16 @@ class ProcurementChatModel(BaseChatModel):
             "budget_analysis": "budget_agent",
             "risk_analysis": "risk_agent",
         }
+        if analysis_strategy is None and role == "pricing_analysis":
+            supplier_strategy = combined.get("supplier_analysis", {}).get("analysis_strategy")
+            analysis_strategy = {
+                "delivery_first": "delivery_recovery",
+                "risk_first": "risk_diversification",
+            }.get(supplier_strategy)
+        if analysis_strategy is None and role in {"budget_analysis", "risk_analysis"}:
+            upstream_strategy = combined.get("pricing_analysis", {}).get("analysis_strategy")
+            if upstream_strategy not in {None, "balanced", "standard"}:
+                analysis_strategy = f"revalidate_{upstream_strategy}"
         task = {
             "request": combined.get("requirement", {}).get("request", {}),
             "inventory_analysis": combined.get("inventory_analysis", {}),
@@ -380,7 +477,12 @@ class ProcurementChatModel(BaseChatModel):
             "pricing_analysis": combined.get("pricing_analysis", {}),
             "budget_analysis": combined.get("budget_analysis", {}),
             "risk_analysis": combined.get("risk_analysis", {}),
-            "replan_reason": combined.get("replan_reason"),
+            "replan_reason": replan_reason
+            or combined.get("replan_reason")
+            or combined.get("pricing_analysis", {}).get("replan_reason")
+            or combined.get("supplier_analysis", {}).get("replan_reason"),
+            "analysis_strategy": analysis_strategy or "standard",
+            "replan_start": replan_start,
         }
         return _call(names[role], {"task": _json(task)})
 

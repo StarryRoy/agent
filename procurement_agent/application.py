@@ -66,9 +66,7 @@ class ProcurementApplication:
         self._successful_tasks = 0
         self._replans = 0
 
-    async def asubmit(
-        self, text: str, *, session_id: str | None = None
-    ) -> ProcurementResponse:
+    async def asubmit(self, text: str, *, session_id: str | None = None) -> ProcurementResponse:
         """Submit a new turn; approval words automatically resume a paused task."""
 
         if session_id and await self.agent.runtime.ais_paused(session_id=session_id):
@@ -109,9 +107,7 @@ class ProcurementApplication:
     def modify(self, session_id: str, change: str) -> ProcurementResponse:
         return self._sync(self.amodify(session_id, change))
 
-    async def astream(
-        self, text: str, *, session_id: str
-    ) -> AsyncIterator[StreamEvent]:
+    async def astream(self, text: str, *, session_id: str) -> AsyncIterator[StreamEvent]:
         async for event in self.agent.astream(text, session_id=session_id):
             yield event
 
@@ -148,6 +144,10 @@ class ProcurementApplication:
         trace_id = str((result.metadata or {}).get("trace_id") or "") or None
         if result.status == "paused":
             data = self._proposal_from_state(result.state or {})
+            data["replan_count"] = max(
+                int(data.get("replan_count") or 0),
+                self.metric_sink.replan_count_for_trace(trace_id),
+            )
             data["approval_status"] = "pending"
             data["execution_status"] = "awaiting_approval"
             plan = data.get("recommended_plan") or {}
@@ -164,9 +164,15 @@ class ProcurementApplication:
                 trace_id=trace_id,
             )
 
-        data = _plain(result.structured_output if result.structured_output is not None else result.output)
+        data = _plain(
+            result.structured_output if result.structured_output is not None else result.output
+        )
         if not isinstance(data, dict):
             data = {"summary": str(data), "warnings": []}
+        data["replan_count"] = max(
+            int(data.get("replan_count") or 0),
+            self.metric_sink.replan_count_for_trace(trace_id),
+        )
         message = str(data.get("summary") or "采购任务处理完成。")
         if count_task:
             self._tasks += 1

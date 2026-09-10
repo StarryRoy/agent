@@ -4,24 +4,26 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from collections.abc import Mapping
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
 from agent_harness import (
     ContextPolicy,
-    DatabaseToolkit,
     ObservabilityConfig,
     RuntimeConfig,
     SQLiteConfig,
     create_agent,
     load_mcp_tools,
 )
+from langchain_core.language_models import BaseChatModel
 
 from .application import ProcurementApplication
 from .database import initialize_database
-from .metrics import JsonLinesEventSink, ProcurementMetricSink
-from .models import ProcurementChatModel
+from .metrics import JsonLinesEventSink, ObservedDatabaseToolkit, ProcurementMetricSink
+from .middleware import ProcurementOrchestrationMiddleware
+from .models import DeterministicProcurementModel
 from .persistence import PersistentSQLiteSaver
 from .schemas import ProcurementDecision, ProcurementState
 from .services import ProcurementServices
@@ -52,9 +54,19 @@ def _instructions(role: str) -> str:
     )
     details = {
         "requirement": "提取产品、数量、预算、交期、质量、优先级和供应商约束；缺失字段必须明确。",
-        "inventory": "计算可用、锁定、在途、安全库存、预测消耗、采购缺口和建议数量。",
-        "supplier": "筛选供应能力、MOQ、交付周期、合作状态和历史表现，并核验外部实时状态。",
-        "pricing": "比较当前与历史价格，计算单一及组合供应方案并识别报价异常。",
+        "inventory": (
+            "计算可用、锁定、在途、安全库存、预测消耗、采购缺口和建议数量。"
+            "task.analysis_strategy 支持 standard、schema_recovery、fallback_recovery。"
+        ),
+        "supplier": (
+            "筛选供应能力、MOQ、交付周期、合作状态和历史表现，并核验外部实时状态。"
+            "重规划时按 task.analysis_strategy 使用 delivery_first、risk_first 或 fallback_recovery。"
+        ),
+        "pricing": (
+            "比较当前与历史价格，计算单一及组合供应方案并识别报价异常。"
+            "重规划时按 task.analysis_strategy 使用 cost_reduction、delivery_recovery 或"
+            "risk_diversification，明确条件性方案。"
+        ),
         "budget": "核验部门总额、已用、已审批未执行、可用预算和本次预计占用。",
         "risk": "评估履约、交付、质量、报价、集中度、历史异常和规模风险。",
         "execution": "只执行 Main Agent 已确认的采购方案，不重新决策。所有写操作使用专用工具。",
@@ -68,8 +80,19 @@ async def create_procurement_app_async(
     reset_database: bool = False,
     enable_mcp: bool = True,
     today: date | None = None,
+    model: BaseChatModel | str | None = None,
+    role_models: Mapping[str, BaseChatModel | str] | None = None,
+    deterministic: bool = False,
 ) -> ProcurementApplication:
-    """Create the complete application with durable local SQLite state."""
+    """Create the application.
+
+    Production callers configure a real model through ``model``, ``role_models``,
+    Harness' configured default, or ``AGENT_HARNESS_MODEL``. The deterministic
+    model is an explicit test double and is never the formal default.
+    """
+
+    if deterministic and (model is not None or role_models):
+        raise ValueError("deterministic test mode cannot be combined with configured LLMs")
 
     root = Path(data_dir).resolve() if data_dir else Path(__file__).resolve().parents[1] / "data"
     root.mkdir(parents=True, exist_ok=True)
@@ -79,19 +102,20 @@ async def create_procurement_app_async(
         checkpoint_path.unlink()
 
     checkpointer = PersistentSQLiteSaver(checkpoint_path)
-    database = DatabaseToolkit(
+    metric_sink = ProcurementMetricSink()
+    event_sink = JsonLinesEventSink(root / "traces.jsonl")
+    sinks = [metric_sink, event_sink]
+    database = ObservedDatabaseToolkit(
         config=SQLiteConfig(database=business_path),
         max_rows=200,
         include_write=True,
         require_write_approval=False,
+        event_sinks=sinks,
     )
     services = ProcurementServices(database, today or datetime.now(UTC).date())
     tools = services.tools()
     mcp_tools = await _supplier_mcp_tools() if enable_mcp else []
 
-    metric_sink = ProcurementMetricSink()
-    event_sink = JsonLinesEventSink(root / "traces.jsonl")
-    sinks = [metric_sink, event_sink]
     sub_config = RuntimeConfig(
         max_iterations=5,
         retry_attempts=2,
@@ -113,6 +137,8 @@ async def create_procurement_app_async(
             summary_threshold=1_000,
             summary_token_threshold=1_000_000,
             summary_keep_recent=100,
+            max_tool_results=24,
+            max_tool_result_chars=50_000,
         ),
         observability=ObservabilityConfig(payload_detail="standard"),
     )
@@ -127,6 +153,13 @@ async def create_procurement_app_async(
         "risk": "analyze_risk",
         "execution": "execute_procurement_plan",
     }
+    configured_roles = dict(role_models or {})
+
+    def model_for(role: str) -> BaseChatModel | str | None:
+        if deterministic:
+            return DeterministicProcurementModel(role=role)
+        return configured_roles.get(role, model)
+
     for role in ("requirement", "inventory", "supplier", "pricing", "budget", "risk", "execution"):
         role_tools = [tools[role_tool_names[role]]]
         if role == "supplier":
@@ -136,7 +169,7 @@ async def create_procurement_app_async(
                 name=f"{role}_agent",
                 description=f"企业采购{role}专业分析与处理",
                 instructions=_instructions(role),
-                model=ProcurementChatModel(role=role),
+                model=model_for(role),
                 tools=role_tools,
                 runtime_config=sub_config,
                 checkpointer=checkpointer,
@@ -148,15 +181,27 @@ async def create_procurement_app_async(
         name="procurement_main_agent",
         description="动态协调采购分析、审批和执行",
         instructions=(
-            "你是企业采购 Main Agent。按当前需求动态选择 SubAgent；保留已确认结果，只重跑受影响"
-            "领域；遇到超预算、交期冲突或高风险时反思并重规划；形成方案后必须通过 Execution "
-            "Agent 的 HITL 审批才能写入业务系统。"
+            "你是企业采购 Main Agent，由你基于对话上下文动态选择、组合和重复调用专业 SubAgent，"
+            "禁止按预设固定流水线机械调用。先判断已有证据和缺失字段；库存足够时直接结束。每次委派"
+            "的 task 使用 JSON，携带相关既有结构化结果、analysis_strategy、replan_reason 和"
+            "replan_start。会话修改时只重跑受影响的分析并复用其他有效结果。\n"
+            "反思策略：数据库结构或查询失败时以 schema_recovery 重试受影响 Agent；SubAgent 数据"
+            "不足时使用 fallback_recovery 并缩小查询目标；全部超预算时让 Pricing Agent 使用"
+            "cost_reduction，生成谈判目标或预算内分阶段备选，再重跑 Budget/Risk；交期不满足时先"
+            "让 Supplier Agent 使用 delivery_first，再让 Pricing Agent 使用 delivery_recovery；"
+            "供应商风险过高时让 Supplier Agent 使用 risk_first，Pricing Agent 使用"
+            "risk_diversification。一次重规划只在首个调整调用设置 replan_start=true。若新策略仍"
+            "违反硬约束，明确阻断执行并请求用户调整，不得伪造可行性。\n"
+            "形成可行方案后，把 request、recommended_plan、budget_analysis 交给 Execution Agent。"
+            "Execution Agent 内部敏感 Tool 会触发 Harness HITL；未审批不得执行。最终必须返回指定"
+            "结构化格式和可读 summary。"
         ),
-        model=ProcurementChatModel(role="main"),
+        model=model_for("main"),
         subagents=subagents,
         response_format=ProcurementDecision.model_json_schema(),
         state_schema=ProcurementState,
         runtime_config=main_config,
+        middleware=[ProcurementOrchestrationMiddleware()],
         checkpointer=checkpointer,
         event_sinks=sinks,
     )

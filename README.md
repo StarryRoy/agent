@@ -4,8 +4,10 @@
 供应商、价格、预算、风险与执行七个 SubAgent；采购写操作由 Execution Agent 发起，并由
 Harness 原生 HITL 在持久化 Checkpoint 上暂停和恢复。
 
-应用默认使用确定性、可离线运行的 `BaseChatModel` 来驱动真实的 Harness Agent/Tool 循环，
-因此演示、异常注入和回归评测不依赖外部模型密钥。业务数据访问统一经过 Harness 的
+正式应用由真实、可配置的 LangChain `BaseChatModel` 驱动 Harness Agent/Tool 循环。Main
+Agent 根据会话证据动态选择和协调 SubAgent；项目不会在未配置模型时隐式退回 Python 规则。
+确定性 `DeterministicProcurementModel` 仅通过 `deterministic=True` 或 CLI 的
+`--deterministic` 显式启用，专用于离线回归和异常注入。业务数据访问统一经过 Harness 的
 `DatabaseToolkit`，外部供应商状态通过 Harness `load_mcp_tools()` 加载的本地标准 MCP Server
 获取。项目没有修改 `agent_harness`。
 
@@ -45,17 +47,25 @@ cd D:\Project\agent
 
 ## 快速运行
 
-完整验收示例（分析、暂停、批准、执行）：
+正式运行前传入 LangChain 模型对象，或按 Harness 公开配置设置模型。例如，安装所选模型的
+LangChain provider 后：
 
 ```powershell
+$env:AGENT_HARNESS_MODEL = "provider:model-name"
 .\.venv\Scripts\python.exe main.py --data-dir .\data demo --approve --session demo-001
+```
+
+也可以使用 `--model provider:model-name`。完整离线验收示例必须显式启用测试 Mock：
+
+```powershell
+.\.venv\Scripts\python.exe main.py --data-dir .\data --deterministic demo --approve --session demo-001
 ```
 
 分步操作：
 
 ```powershell
-.\.venv\Scripts\python.exe main.py request "下个月需要采购500台设备，预算80万，月底前必须到货。" --session buy-001
-.\.venv\Scripts\python.exe main.py approve buy-001
+.\.venv\Scripts\python.exe main.py --model provider:model-name request "下个月需要采购500台设备，预算80万，月底前必须到货。" --session buy-001
+.\.venv\Scripts\python.exe main.py --model provider:model-name approve buy-001
 ```
 
 也可以在审批前修改；应用会拒绝旧的待执行 Tool Call，保留先前证据，再只重跑受影响部分：
@@ -74,9 +84,12 @@ cd D:\Project\agent
 Python API：
 
 ```python
+from langchain_openai import ChatOpenAI
+
 from procurement_agent import create_procurement_app
 
-with create_procurement_app(data_dir="data") as app:
+model = ChatOpenAI(model="your-approved-model")
+with create_procurement_app(data_dir="data", model=model) as app:
     proposal = app.submit(
         "下个月需要采购500台设备，预算80万，月底前必须到货。",
         session_id="buy-001",
@@ -113,7 +126,8 @@ with create_procurement_app(data_dir="data") as app:
 `harness_approval` 元数据。执行前 AgentResult 为 `paused`，公开应用状态为
 `approval_required`；`approve`、`reject` 或业务修改均从同一个公开 Session ID 恢复。
 
-批准后，Execution Agent 使用 `DatabaseToolkit.execute_write()` 完成：
+批准后，Execution Agent 使用一次 `DatabaseToolkit.execute_write()` 进入明确的数据库事务
+边界，由数据库约束与触发器原子完成：
 
 1. 创建采购申请并记录批准状态；
 2. 按供应商分配创建采购订单；
@@ -121,20 +135,25 @@ with create_procurement_app(data_dir="data") as app:
 4. 修改采购状态；
 5. 写入审批及操作日志。
 
-执行前会再次读取预算，发现预算已变化时安全失败。所有结果都返回明确的已执行动作和失败原因。
+任何订单、预算、状态、审批结果或日志步骤失败，整个语句都会回滚，不会留下部分采购申请、
+订单或预算占用。写入成功后再读取并验证事务不变量；验证失败不会返回成功。公开 Session ID
+同时写入采购申请和业务操作日志，便于按会话审计。
 
 ## Observability 与 Metrics
 
 每次 Main/SubAgent、Model、Tool、MCP、HITL、Retry 和执行调用都由 Harness Observer 记录。
 脱敏后的完整事件追加到 `data/traces.jsonl`。`app.metrics()` 合并 Harness
 `MetricsEventSink` 与业务分类，返回任务成功率、Agent/SubAgent/Tool/Database/MCP 调用数、
-Retry、Replan、HITL、总耗时、阶段耗时、Token 使用量和错误率。
+Retry、Replan、HITL、总耗时、阶段耗时、Token 使用量和错误率。Database 指标来自每一次真实
+`DatabaseToolkit` 操作，而不是外层业务 Tool 的数量。
 
 ## Eval 与测试
 
 固定评测集 `evals/scenarios.json` 覆盖规划要求中的 16 个场景：正常采购、无需采购、数量调整、
 多供应商、预算不足、全部超预算、交期不满足、高风险供应商、条件修改、SQL/SubAgent/MCP
-失败、HITL 修改/拒绝以及执行成功/失败。
+失败、HITL 修改/拒绝以及执行成功/失败。每个场景同时检查 SubAgent 路由、Tool 调用序列、
+数据库与 MCP 操作次数、参数提取、最终方案、异常恢复策略、无效调用、耗时和 Token 预算，
+并输出逐维准确率。固定评测显式使用确定性测试模型，因此不消耗正式模型额度。
 
 ```powershell
 # 完整测试

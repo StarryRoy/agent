@@ -3,11 +3,21 @@ from __future__ import annotations
 from datetime import date
 
 import pytest
+from langchain_core.language_models import FakeListChatModel
 
 from procurement_agent import create_procurement_app
+from procurement_agent.evaluation import run_evaluation
+from procurement_agent.models import DeterministicProcurementModel
 
 TODAY = date(2026, 9, 10)
 REQUEST = "下个月需要采购500台设备，预算80万，月底前必须到货。"
+
+
+class BindableFakeChatModel(FakeListChatModel):
+    """Non-procurement model double used only to verify factory wiring."""
+
+    def bind_tools(self, tools, **kwargs):
+        return self
 
 
 @pytest.fixture
@@ -17,6 +27,7 @@ def app(tmp_path):
         reset_database=True,
         enable_mcp=False,
         today=TODAY,
+        deterministic=True,
     )
     try:
         yield application
@@ -59,6 +70,10 @@ def test_full_flow_pauses_then_executes_after_approval(app):
     requests = app.database.execute_query("SELECT status, approval_status FROM purchase_requests")
     assert requests["rows"] == [{"status": "ordered", "approval_status": "approved"}]
     assert len(app.database.execute_query("SELECT id FROM purchase_orders")["rows"]) == 2
+    audit = app.database.execute_query("SELECT session_id, action, result FROM operation_logs")
+    assert audit["rows"] == [
+        {"session_id": "full-flow", "action": "approve_and_execute", "result": "success"}
+    ]
 
 
 def test_inventory_sufficient_short_circuits_other_agents(app):
@@ -104,24 +119,41 @@ def test_all_quotes_over_budget_replans_then_blocks(app):
     assert app.database.execute_query("SELECT id FROM purchase_requests")["row_count"] == 0
 
 
-@pytest.mark.parametrize("failure_flag", ["simulate_sql_failure", "simulate_subagent_failure"])
-def test_analysis_failure_retries_then_blocks(app, failure_flag):
-    text = (
-        '{"text":"下个月需要500台设备，预算80万。","'
-        + failure_flag
-        + '":true}'
-    )
+@pytest.mark.parametrize(
+    ("failure_flag", "strategy", "database_errors", "error_events"),
+    [
+        ("simulate_sql_failure", "schema_recovery", 1, 0),
+        ("simulate_subagent_failure", "fallback_recovery", 0, 1),
+    ],
+)
+def test_analysis_failure_changes_strategy_and_only_reruns_affected_agent(
+    app, failure_flag, strategy, database_errors, error_events
+):
+    text = '{"text":"下个月需要500台设备，预算80万。","' + failure_flag + '":true}'
     result = app.submit(text, session_id=failure_flag)
-    assert result.status == "completed"
-    assert result.data["execution_status"] == "blocked"
+    assert result.status == "approval_required"
+    assert result.data["execution_status"] == "awaiting_approval"
     assert result.data["replan_count"] == 1
+    metrics = app.metrics()
+    assert metrics["database_errors"] == database_errors
+    assert metrics["errors"] == error_events
+    assert [item["strategy"] for item in metrics["replan_strategies"]] == [strategy]
+    assert metrics["subagent_route"].count("inventory_agent") == 2
+    assert metrics["subagent_route"].count("supplier_agent") == 1
+    assert metrics["subagent_route"].count("pricing_agent") == 1
+    if strategy == "schema_recovery":
+        assert metrics["database_route"][:3] == [
+            "execute_query",
+            "get_schema",
+            "execute_query",
+        ]
+        assert result.data["inventory_analysis"]["schema_evidence"]["ok"] is True
+    else:
+        assert "15%" in result.data["inventory_analysis"]["fallback_basis"]
 
 
 def test_execution_failure_is_explicit_and_does_not_create_request(app):
-    text = (
-        '{"text":"下个月需要500台设备，预算80万。",'
-        '"simulate_execution_failure":true}'
-    )
+    text = '{"text":"下个月需要500台设备，预算80万。","simulate_execution_failure":true}'
     assert app.submit(text, session_id="execution-failure").status == "approval_required"
     result = app.approve("execution-failure")
     assert result.data["execution_status"] == "failed"
@@ -134,13 +166,19 @@ def test_checkpoint_survives_application_restart(tmp_path):
         reset_database=True,
         enable_mcp=False,
         today=TODAY,
+        deterministic=True,
     )
     try:
         assert first.submit(REQUEST, session_id="durable").status == "approval_required"
     finally:
         first.close()
 
-    second = create_procurement_app(data_dir=tmp_path, enable_mcp=False, today=TODAY)
+    second = create_procurement_app(
+        data_dir=tmp_path,
+        enable_mcp=False,
+        today=TODAY,
+        deterministic=True,
+    )
     try:
         result = second.approve("durable")
         assert result.data["execution_status"] == "success"
@@ -154,15 +192,119 @@ def test_mcp_supplier_status_is_observed_and_can_fallback(tmp_path):
         reset_database=True,
         enable_mcp=True,
         today=TODAY,
+        deterministic=True,
     )
     try:
-        text = (
-            '{"text":"下个月需要500台设备，预算80万。",'
-            '"simulate_mcp_failure":true}'
-        )
+        text = '{"text":"下个月需要500台设备，预算80万。","simulate_mcp_failure":true}'
         result = application.submit(text, session_id="mcp-fallback")
         assert result.status == "approval_required"
         assert application.metrics()["mcp_calls"] >= 1
         assert any("MCP" in warning for warning in result.data["warnings"])
     finally:
         application.close()
+
+
+def test_production_factory_uses_explicit_configured_model(tmp_path):
+    configured_model = BindableFakeChatModel(responses=["{}"])
+    application = create_procurement_app(
+        data_dir=tmp_path,
+        reset_database=True,
+        enable_mcp=False,
+        model=configured_model,
+    )
+    try:
+        assert application.agent.definition.model is configured_model
+        assert not isinstance(application.agent.definition.model, DeterministicProcurementModel)
+        assert all(
+            subagent.definition.model is configured_model
+            for subagent in application.agent._subagents.values()
+        )
+    finally:
+        application.close()
+
+
+def test_budget_replan_changes_pricing_strategy_and_reuses_valid_analysis(app):
+    result = app.submit("下个月需要500台设备，预算10万。", session_id="strategy-budget")
+    assert result.data["execution_status"] == "blocked"
+    metrics = app.metrics()
+    assert [item["strategy"] for item in metrics["replan_strategies"]] == ["cost_reduction"]
+    assert metrics["subagent_route"].count("inventory_agent") == 1
+    assert metrics["subagent_route"].count("supplier_agent") == 1
+    assert metrics["subagent_route"].count("pricing_agent") == 2
+    assert result.data["pricing_analysis"]["analysis_strategy"] == "cost_reduction"
+
+
+def test_deadline_replan_uses_delivery_path_without_rerunning_inventory(app):
+    result = app.submit(
+        "需要采购500台设备，预算80万，2026-09-15必须到货。",
+        session_id="strategy-deadline",
+    )
+    assert result.data["execution_status"] == "blocked"
+    metrics = app.metrics()
+    assert [item["strategy"] for item in metrics["replan_strategies"]] == ["delivery_first"]
+    assert metrics["subagent_route"].count("inventory_agent") == 1
+    assert metrics["subagent_route"].count("supplier_agent") == 2
+    assert metrics["subagent_route"].count("pricing_agent") == 2
+    assert result.data["pricing_analysis"]["analysis_strategy"] == "delivery_recovery"
+
+
+def test_delivery_recovery_can_generate_a_materially_new_feasible_plan(app):
+    result = app.submit(
+        "需要采购500台设备，预算90万，2026-09-22必须到货。",
+        session_id="strategy-delivery-solution",
+    )
+    assert result.status == "approval_required"
+    assert result.data["replan_count"] == 1
+    assert result.data["pricing_analysis"]["analysis_strategy"] == "delivery_recovery"
+    assert result.data["recommended_plan"]["conditional"] is True
+    assert result.data["recommended_plan"]["meets_deadline"] is True
+    assert result.data["recommended_plan"]["max_lead_time_days"] <= 12
+
+
+def test_execution_transaction_rolls_back_every_critical_write(app):
+    text = '{"text":"下个月需要采购500台设备，预算80万。","simulate_atomic_failure":true}'
+    assert app.submit(text, session_id="atomic-boundary").status == "approval_required"
+    budget_before = app.database.execute_query(
+        "SELECT approved_pending_amount FROM budgets WHERE id = 1"
+    )["rows"][0]["approved_pending_amount"]
+
+    result = app.approve("atomic-boundary")
+
+    assert result.data["execution_status"] == "failed"
+    assert result.data["executed_actions"] == []
+    for table in ("purchase_requests", "purchase_orders", "operation_logs"):
+        rows = app.database.execute_query(f"SELECT COUNT(*) AS count FROM {table}")
+        assert rows["rows"] == [{"count": 0}]
+    budget_after = app.database.execute_query(
+        "SELECT approved_pending_amount FROM budgets WHERE id = 1"
+    )["rows"][0]["approved_pending_amount"]
+    assert budget_after == budget_before
+
+
+def test_database_metrics_count_each_real_toolkit_operation(app):
+    assert app.submit(REQUEST, session_id="database-metrics").status == "approval_required"
+    assert app.approve("database-metrics").data["execution_status"] == "success"
+    metrics = app.metrics()
+    assert metrics["database_calls"] == 7
+    assert metrics["database_route"] == ["execute_query"] * 5 + [
+        "execute_write",
+        "execute_query",
+    ]
+
+
+def test_evaluation_reports_all_target_dimensions():
+    report = run_evaluation(limit=2)
+    result = report.as_dict()
+    assert result["metrics"]["passed"] == 2
+    assert result["metrics"]["invalid_calls"] == 0
+    for dimension in (
+        "routing_accuracy",
+        "tool_use_accuracy",
+        "parameter_extraction_accuracy",
+        "final_plan_accuracy",
+        "exception_recovery_rate",
+        "zero_invalid_call_rate",
+        "duration_budget_rate",
+        "token_budget_rate",
+    ):
+        assert result["metrics"][dimension] == 1.0

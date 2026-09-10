@@ -3,35 +3,68 @@
     "id": "normal_purchase",
     "description": "正常采购",
     "input": "下个月需要采购500台设备，预算80万，月底前必须到货。",
-    "expected_status": "approval_required"
+    "expected_status": "approval_required",
+    "expected_execution_status": "awaiting_approval",
+    "expected_request": {"quantity": 500, "budget": 800000.0, "latest_delivery_date": "2026-10-31"},
+    "expected_route_profile": "normal",
+    "expected_database_calls": 5,
+    "expected_min_mcp_calls": 1,
+    "expected_plan_id": "PLAN-2",
+    "expected_purchase_quantity": 445,
+    "expected_min_allocations": 2,
+    "expected_plan_suppliers": ["SUP-A", "SUP-B"],
+    "expected_max_total_cost": 640600.0
   },
   {
     "id": "inventory_sufficient",
     "description": "库存充足无需采购",
     "input": "下个月需要50台设备，预算20万。",
     "expected_status": "completed",
-    "expected_execution_status": "not_required"
+    "expected_execution_status": "not_required",
+    "expected_request": {"quantity": 50, "budget": 200000.0},
+    "expected_route_profile": "inventory_only",
+    "expected_database_calls": 1,
+    "expected_plan_id": "NO-PURCHASE",
+    "expected_purchase_quantity": 0,
+    "forbidden_tools": ["analyze_suppliers", "analyze_pricing", "analyze_budget", "analyze_risk", "execute_procurement_plan"]
   },
   {
     "id": "quantity_adjustment",
     "description": "实际采购数量需要调整",
     "input": "下个月需要500台设备，预算80万。",
     "expected_status": "approval_required",
-    "expected_purchase_quantity": 445
+    "expected_request": {"quantity": 500, "budget": 800000.0},
+    "expected_route_profile": "normal",
+    "expected_database_calls": 5,
+    "expected_purchase_quantity": 445,
+    "expected_plan_id": "PLAN-2"
   },
   {
     "id": "multi_supplier",
     "description": "多供应商比较与组合",
     "input": "下个月需要500台设备，预算80万，必须控制集中采购风险。",
     "expected_status": "approval_required",
-    "expected_min_allocations": 2
+    "expected_request": {"quantity": 500, "budget": 800000.0},
+    "expected_route_profile": "normal",
+    "expected_database_calls": 5,
+    "expected_plan_id": "PLAN-2",
+    "expected_purchase_quantity": 445,
+    "expected_min_allocations": 2,
+    "expected_plan_suppliers": ["SUP-A", "SUP-B"]
   },
   {
     "id": "budget_insufficient",
     "description": "预算不足",
     "input": "下个月需要500台设备，预算60万。",
     "expected_status": "completed",
-    "expected_execution_status": "blocked"
+    "expected_execution_status": "blocked",
+    "expected_request": {"quantity": 500, "budget": 600000.0},
+    "expected_route_profile": "risk_replan",
+    "expected_database_calls": 9,
+    "expected_plan_id": null,
+    "expected_min_replans": 1,
+    "expected_max_replans": 1,
+    "expected_recovery_strategies": ["risk_first"]
   },
   {
     "id": "all_over_budget",
@@ -39,48 +72,99 @@
     "input": "下个月需要500台设备，预算10万。",
     "expected_status": "completed",
     "expected_execution_status": "blocked",
-    "expected_min_replans": 1
+    "expected_request": {"quantity": 500, "budget": 100000.0},
+    "expected_route_profile": "cost_replan",
+    "expected_database_calls": 8,
+    "expected_plan_id": null,
+    "expected_min_replans": 1,
+    "expected_max_replans": 1,
+    "expected_recovery_strategies": ["cost_reduction"]
   },
   {
     "id": "deadline_unmet",
     "description": "供应商交付时间均不满足",
     "input": "需要采购500台设备，预算80万，2026-09-15必须到货。",
     "expected_status": "completed",
-    "expected_execution_status": "blocked"
+    "expected_execution_status": "blocked",
+    "expected_request": {"quantity": 500, "budget": 800000.0, "latest_delivery_date": "2026-09-15"},
+    "expected_route_profile": "delivery_replan",
+    "expected_database_calls": 7,
+    "expected_plan_id": null,
+    "expected_min_replans": 1,
+    "expected_max_replans": 1,
+    "expected_recovery_strategies": ["delivery_first"]
   },
   {
     "id": "supplier_risk_high",
     "description": "剩余可用供应商风险过高",
     "input": "下个月需要500台设备，预算80万，不要供应商A并排除供应商D。",
     "expected_status": "completed",
-    "expected_execution_status": "blocked"
+    "expected_execution_status": "blocked",
+    "expected_request": {"quantity": 500, "budget": 800000.0, "excluded_suppliers": ["SUP-A", "SUP-D"]},
+    "expected_route_profile": "risk_replan",
+    "expected_database_calls": 9,
+    "expected_plan_id": null,
+    "expected_min_replans": 1,
+    "expected_max_replans": 1,
+    "expected_recovery_strategies": ["risk_first"]
   },
   {
     "id": "user_modifies_conditions",
     "description": "用户修改采购条件",
     "input": "下个月需要500台设备，预算80万。",
     "actions": [{"type": "modify", "value": "把数量改成400台，不要供应商A。"}],
-    "expected_status": "approval_required"
+    "expected_status": "approval_required",
+    "expected_execution_status": "awaiting_approval",
+    "expected_request": {"quantity": 400, "budget": 800000.0, "excluded_suppliers": ["SUP-A"]},
+    "expected_route_profile": "modify_full",
+    "expected_database_calls": 10,
+    "expected_plan_id": "PLAN-2",
+    "expected_purchase_quantity": 345
   },
   {
     "id": "sql_failure",
-    "description": "SQL 查询失败",
+    "description": "SQL 查询失败后按数据库结构恢复",
     "input": "{\"text\":\"下个月需要500台设备，预算80万。\",\"simulate_sql_failure\":true}",
-    "expected_status": "completed",
-    "expected_execution_status": "blocked"
+    "expected_status": "approval_required",
+    "expected_execution_status": "awaiting_approval",
+    "expected_request": {"quantity": 500, "budget": 800000.0, "simulate_sql_failure": true},
+    "expected_route_profile": "inventory_recovery",
+    "expected_database_calls": 7,
+    "expected_min_database_errors": 1,
+    "expected_min_replans": 1,
+    "expected_max_replans": 1,
+    "expected_recovery_strategies": ["schema_recovery"],
+    "expected_plan_id": "PLAN-2",
+    "expected_purchase_quantity": 445
   },
   {
     "id": "subagent_failure",
-    "description": "SubAgent 执行失败",
+    "description": "SubAgent 执行失败后使用降级策略恢复",
     "input": "{\"text\":\"下个月需要500台设备，预算80万。\",\"simulate_subagent_failure\":true}",
-    "expected_status": "completed",
-    "expected_execution_status": "blocked"
+    "expected_status": "approval_required",
+    "expected_execution_status": "awaiting_approval",
+    "expected_request": {"quantity": 500, "budget": 800000.0, "simulate_subagent_failure": true},
+    "expected_route_profile": "inventory_recovery",
+    "expected_database_calls": 5,
+    "expected_min_replans": 1,
+    "expected_max_replans": 1,
+    "expected_recovery_strategies": ["fallback_recovery"],
+    "expected_max_error_events": 1,
+    "expected_plan_id": "PLAN-2",
+    "expected_purchase_quantity": 445
   },
   {
     "id": "mcp_failure",
     "description": "MCP 调用失败并降级",
     "input": "{\"text\":\"下个月需要500台设备，预算80万。\",\"simulate_mcp_failure\":true}",
-    "expected_status": "approval_required"
+    "expected_status": "approval_required",
+    "expected_execution_status": "awaiting_approval",
+    "expected_request": {"quantity": 500, "budget": 800000.0, "simulate_mcp_failure": true},
+    "expected_route_profile": "normal",
+    "expected_database_calls": 5,
+    "expected_min_mcp_calls": 1,
+    "expected_plan_id": "PLAN-2",
+    "expected_purchase_quantity": 445
   },
   {
     "id": "hitl_edit",
@@ -88,7 +172,12 @@
     "input": "下个月需要500台设备，预算80万。",
     "actions": [{"type": "modify", "value": "把数量改成400台。"}],
     "expected_status": "approval_required",
-    "expected_request_quantity": 400
+    "expected_execution_status": "awaiting_approval",
+    "expected_request": {"quantity": 400, "budget": 800000.0},
+    "expected_route_profile": "modify_full",
+    "expected_database_calls": 10,
+    "expected_plan_id": "PLAN-2",
+    "expected_purchase_quantity": 345
   },
   {
     "id": "hitl_reject",
@@ -96,7 +185,12 @@
     "input": "下个月需要500台设备，预算80万。",
     "actions": [{"type": "reject"}],
     "expected_status": "completed",
-    "expected_approval_status": "rejected"
+    "expected_execution_status": "failed",
+    "expected_approval_status": "rejected",
+    "expected_request": {"quantity": 500, "budget": 800000.0},
+    "expected_route_profile": "hitl_resume",
+    "expected_database_calls": 5,
+    "forbidden_tools": ["execute_procurement_plan"]
   },
   {
     "id": "execution_success",
@@ -104,7 +198,14 @@
     "input": "下个月需要500台设备，预算80万。",
     "actions": [{"type": "approve"}],
     "expected_status": "completed",
-    "expected_execution_status": "success"
+    "expected_execution_status": "success",
+    "expected_approval_status": "approved",
+    "expected_request": {"quantity": 500, "budget": 800000.0},
+    "expected_route_profile": "hitl_resume",
+    "expect_execution_tool": true,
+    "expected_database_calls": 7,
+    "expected_plan_id": "PLAN-2",
+    "expected_purchase_quantity": 445
   },
   {
     "id": "execution_failure",
@@ -112,6 +213,13 @@
     "input": "{\"text\":\"下个月需要500台设备，预算80万。\",\"simulate_execution_failure\":true}",
     "actions": [{"type": "approve"}],
     "expected_status": "completed",
-    "expected_execution_status": "failed"
+    "expected_execution_status": "failed",
+    "expected_approval_status": "approved",
+    "expected_request": {"quantity": 500, "budget": 800000.0, "simulate_execution_failure": true},
+    "expected_route_profile": "hitl_resume",
+    "expect_execution_tool": true,
+    "expected_database_calls": 5,
+    "expected_plan_id": "PLAN-2",
+    "expected_purchase_quantity": 445
   }
 ]
