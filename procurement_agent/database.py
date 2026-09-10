@@ -5,6 +5,24 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+from agent_harness import SQLiteBackend, SQLiteConfig
+
+
+class ProcurementSQLiteBackend(SQLiteBackend):
+    """Enable foreign keys while retaining Harness-owned transactions and cleanup."""
+
+    def __init__(self, config: SQLiteConfig) -> None:
+        super().__init__(config=config)
+        try:
+            # PRAGMAs belong to a connection, not the initialized database file.
+            self._connection.execute("PRAGMA foreign_keys = ON")
+            if self._connection.execute("PRAGMA foreign_keys").fetchone() != (1,):
+                raise RuntimeError("SQLite foreign key enforcement could not be enabled")
+        except Exception:
+            self.close()
+            raise
+
+
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
 

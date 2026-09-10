@@ -20,7 +20,7 @@ from agent_harness import (
 from langchain_core.language_models import BaseChatModel
 
 from .application import ProcurementApplication
-from .database import initialize_database
+from .database import ProcurementSQLiteBackend, initialize_database
 from .metrics import JsonLinesEventSink, ObservedDatabaseToolkit, ProcurementMetricSink
 from .middleware import ProcurementOrchestrationMiddleware
 from .models import DeterministicProcurementModel
@@ -106,7 +106,7 @@ async def create_procurement_app_async(
     event_sink = JsonLinesEventSink(root / "traces.jsonl")
     sinks = [metric_sink, event_sink]
     database = ObservedDatabaseToolkit(
-        config=SQLiteConfig(database=business_path),
+        backend=ProcurementSQLiteBackend(SQLiteConfig(database=business_path)),
         max_rows=200,
         include_write=True,
         require_write_approval=False,

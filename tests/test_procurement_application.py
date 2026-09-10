@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import sqlite3
+from contextlib import closing
 from datetime import date
 
 import pytest
@@ -8,6 +11,7 @@ from langchain_core.language_models import FakeListChatModel
 from procurement_agent import create_procurement_app
 from procurement_agent.evaluation import run_evaluation
 from procurement_agent.models import DeterministicProcurementModel
+from procurement_agent.services import ProcurementServices
 
 TODAY = date(2026, 9, 10)
 REQUEST = "下个月需要采购500台设备，预算80万，月底前必须到货。"
@@ -279,6 +283,34 @@ def test_execution_transaction_rolls_back_every_critical_write(app):
         "SELECT approved_pending_amount FROM budgets WHERE id = 1"
     )["rows"][0]["approved_pending_amount"]
     assert budget_after == budget_before
+
+
+def test_business_connection_enforces_foreign_keys_and_recovers(app, tmp_path):
+    assert app.database.execute_query(
+        "SELECT foreign_keys FROM pragma_foreign_keys"
+    )["rows"] == [{"foreign_keys": 1}]
+    proposal = app.submit(REQUEST, session_id="foreign-key")
+    assert proposal.status == "approval_required"
+    envelope = {**proposal.data, "session_id": "foreign-key"}
+    envelope = json.loads(json.dumps(envelope))
+    envelope["recommended_plan"]["allocations"][-1]["supplier_id"] = -1
+    budget_before = app.database.execute_query("SELECT * FROM budgets")["rows"]
+
+    result = ProcurementServices(app.database, TODAY).execute_plan(json.dumps(envelope))
+
+    assert result["status"] == "failed"
+    assert result["error"]["database_error"]["type"] == "constraint_violation"
+    assert result["executed_actions"] == []
+    for table in ("purchase_requests", "purchase_orders", "operation_logs"):
+        assert app.database.execute_query(f"SELECT COUNT(*) AS count FROM {table}")["rows"] == [
+            {"count": 0}
+        ]
+    assert app.database.execute_query("SELECT * FROM budgets")["rows"] == budget_before
+
+    assert app.approve("foreign-key").data["execution_status"] == "success"
+    # A separate connection must observe the committed trigger writes.
+    with closing(sqlite3.connect(tmp_path / "procurement.sqlite")) as persisted:
+        assert persisted.execute("SELECT COUNT(*) FROM purchase_orders").fetchone() == (2,)
 
 
 def test_database_metrics_count_each_real_toolkit_operation(app):
