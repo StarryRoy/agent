@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "enterprise-procurement-agent"
+version = "0.1.0"
+description = "A Harness-based multi-agent procurement decision and execution app"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "agent-harness",
+  "langchain-core>=0.3.30,<2",
+  "langgraph>=0.2.60,<2",
+  "langgraph-checkpoint-sqlite>=3,<4",
+  "langchain-mcp-adapters>=0.1,<1",
+  "pydantic>=2.7,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9", "ruff>=0.9,<1"]
+
+[project.scripts]
+procurement-agent = "procurement_agent.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["procurement_agent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100

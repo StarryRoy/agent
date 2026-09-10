@@ -1,0 +1,117 @@
+[
+  {
+    "id": "normal_purchase",
+    "description": "正常采购",
+    "input": "下个月需要采购500台设备，预算80万，月底前必须到货。",
+    "expected_status": "approval_required"
+  },
+  {
+    "id": "inventory_sufficient",
+    "description": "库存充足无需采购",
+    "input": "下个月需要50台设备，预算20万。",
+    "expected_status": "completed",
+    "expected_execution_status": "not_required"
+  },
+  {
+    "id": "quantity_adjustment",
+    "description": "实际采购数量需要调整",
+    "input": "下个月需要500台设备，预算80万。",
+    "expected_status": "approval_required",
+    "expected_purchase_quantity": 445
+  },
+  {
+    "id": "multi_supplier",
+    "description": "多供应商比较与组合",
+    "input": "下个月需要500台设备，预算80万，必须控制集中采购风险。",
+    "expected_status": "approval_required",
+    "expected_min_allocations": 2
+  },
+  {
+    "id": "budget_insufficient",
+    "description": "预算不足",
+    "input": "下个月需要500台设备，预算60万。",
+    "expected_status": "completed",
+    "expected_execution_status": "blocked"
+  },
+  {
+    "id": "all_over_budget",
+    "description": "所有供应商超预算并重新规划",
+    "input": "下个月需要500台设备，预算10万。",
+    "expected_status": "completed",
+    "expected_execution_status": "blocked",
+    "expected_min_replans": 1
+  },
+  {
+    "id": "deadline_unmet",
+    "description": "供应商交付时间均不满足",
+    "input": "需要采购500台设备，预算80万，2026-09-15必须到货。",
+    "expected_status": "completed",
+    "expected_execution_status": "blocked"
+  },
+  {
+    "id": "supplier_risk_high",
+    "description": "剩余可用供应商风险过高",
+    "input": "下个月需要500台设备，预算80万，不要供应商A并排除供应商D。",
+    "expected_status": "completed",
+    "expected_execution_status": "blocked"
+  },
+  {
+    "id": "user_modifies_conditions",
+    "description": "用户修改采购条件",
+    "input": "下个月需要500台设备，预算80万。",
+    "actions": [{"type": "modify", "value": "把数量改成400台，不要供应商A。"}],
+    "expected_status": "approval_required"
+  },
+  {
+    "id": "sql_failure",
+    "description": "SQL 查询失败",
+    "input": "{\"text\":\"下个月需要500台设备，预算80万。\",\"simulate_sql_failure\":true}",
+    "expected_status": "completed",
+    "expected_execution_status": "blocked"
+  },
+  {
+    "id": "subagent_failure",
+    "description": "SubAgent 执行失败",
+    "input": "{\"text\":\"下个月需要500台设备，预算80万。\",\"simulate_subagent_failure\":true}",
+    "expected_status": "completed",
+    "expected_execution_status": "blocked"
+  },
+  {
+    "id": "mcp_failure",
+    "description": "MCP 调用失败并降级",
+    "input": "{\"text\":\"下个月需要500台设备，预算80万。\",\"simulate_mcp_failure\":true}",
+    "expected_status": "approval_required"
+  },
+  {
+    "id": "hitl_edit",
+    "description": "HITL 修改方案",
+    "input": "下个月需要500台设备，预算80万。",
+    "actions": [{"type": "modify", "value": "把数量改成400台。"}],
+    "expected_status": "approval_required",
+    "expected_request_quantity": 400
+  },
+  {
+    "id": "hitl_reject",
+    "description": "HITL 拒绝",
+    "input": "下个月需要500台设备，预算80万。",
+    "actions": [{"type": "reject"}],
+    "expected_status": "completed",
+    "expected_approval_status": "rejected"
+  },
+  {
+    "id": "execution_success",
+    "description": "最终采购执行成功",
+    "input": "下个月需要500台设备，预算80万。",
+    "actions": [{"type": "approve"}],
+    "expected_status": "completed",
+    "expected_execution_status": "success"
+  },
+  {
+    "id": "execution_failure",
+    "description": "最终采购执行失败",
+    "input": "{\"text\":\"下个月需要500台设备，预算80万。\",\"simulate_execution_failure\":true}",
+    "actions": [{"type": "approve"}],
+    "expected_status": "completed",
+    "expected_execution_status": "failed"
+  }
+]
