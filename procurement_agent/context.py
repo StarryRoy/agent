@@ -1,4 +1,4 @@
-"""Lossless business projections; raw tool messages remain in Harness checkpoints."""
+"""Business projections over the model context prepared by Harness."""
 
 from __future__ import annotations
 
@@ -93,7 +93,7 @@ def procurement_context(results: dict, goal: Any = None) -> dict:
         "risks": risk.get("main_risks", []),
         "replan_reason": risk.get("replan_reason"),
         "evidence": {key: value.get("evidence", []) for key, value in results.items()},
-        "sources": {key: value.get("source_ref") for key, value in results.items()},
+        "source_ref": {key: value.get("source_ref") for key, value in results.items()},
     }
 
 
@@ -120,12 +120,6 @@ def task_view(name: str, task: dict) -> dict:
 
 class ProcurementContextMiddleware(AgentMiddleware):
     def before_model(self, request: ModelRequest) -> None:
-        # Rebuild tool views from durable messages before generic character truncation.
-        originals = {
-            item.tool_call_id: item
-            for item in request.state.get("messages", [])
-            if isinstance(item, ToolMessage)
-        }
         messages = []
         results = {}
         # Preserve call/response pairs and counters, but omit replaced results within a turn.
@@ -140,8 +134,30 @@ class ProcurementContextMiddleware(AgentMiddleware):
                 latest[item.name] = item.tool_call_id
         for item in request.messages:
             if isinstance(item, ToolMessage) and item.name not in {"load_skill", "unload_skill"}:
-                original = originals.get(item.tool_call_id, item)
-                value = business_view(decode(original.content))
+                if item.name in FIELDS:
+                    # A new analysis invalidates downstream context until revalidated.
+                    downstream = {
+                        "requirement_agent": list(results),
+                        "inventory_agent": [
+                            "supplier_analysis",
+                            "pricing_analysis",
+                            "budget_analysis",
+                            "risk_analysis",
+                        ],
+                        "supplier_agent": [
+                            "pricing_analysis",
+                            "budget_analysis",
+                            "risk_analysis",
+                        ],
+                        "pricing_agent": ["budget_analysis", "risk_analysis"],
+                        "budget_agent": ["risk_analysis"],
+                    }
+                    for key in downstream.get(item.name, []):
+                        results.pop(key, None)
+
+                # request.messages already reflects Harness compaction and tool-result
+                # limits. Never recover a fuller copy from request.state.
+                value = business_view(decode(item.content))
                 if isinstance(value, dict):
                     payload = value.get("content", value)
                     if isinstance(payload, dict):
@@ -155,25 +171,6 @@ class ProcurementContextMiddleware(AgentMiddleware):
                             },
                         )
                         if item.name in FIELDS:
-                            # A new analysis invalidates downstream context until revalidated.
-                            downstream = {
-                                "requirement_agent": list(results),
-                                "inventory_agent": [
-                                    "supplier_analysis",
-                                    "pricing_analysis",
-                                    "budget_analysis",
-                                    "risk_analysis",
-                                ],
-                                "supplier_agent": [
-                                    "pricing_analysis",
-                                    "budget_analysis",
-                                    "risk_analysis",
-                                ],
-                                "pricing_agent": ["budget_analysis", "risk_analysis"],
-                                "budget_agent": ["risk_analysis"],
-                            }
-                            for key in downstream.get(item.name, []):
-                                results.pop(key, None)
                             results[FIELDS[item.name]] = payload
                     if item.tool_call_id in superseded:
                         value = {"superseded": True, "tool_call_id": item.tool_call_id}
@@ -202,7 +199,7 @@ class ProcurementContextMiddleware(AgentMiddleware):
             messages.append(item)
         if results:
             context = procurement_context(results)
-            # The values are derived from persisted structured results, not a lossy LLM summary.
+            # Derive durable business facts from retained structured results, not raw history.
             request.execution.metadata["procurement_context"] = context
             messages.insert(
                 1,
