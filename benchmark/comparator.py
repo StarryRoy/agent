@@ -14,6 +14,7 @@ COMPARISON_METRICS = (
     ("Replan 成功率", "replan_success_rate", "rate"),
     ("平均 Tool 调用", "average_tool_calls", "number"),
 )
+COMPARABLE_METADATA = ("model", "role_models", "benchmark_date", "mcp_enabled", "scenario_ids")
 
 
 def _change(before: Any, after: Any, kind: str) -> str:
@@ -33,6 +34,19 @@ def compare_runs(before_path: Path, after_path: Path) -> dict[str, Any]:
         "real_llm"
     ):
         raise ValueError("Before/after comparison only accepts real-LLM benchmark data")
+    before_metadata = before.get("metadata", {})
+    after_metadata = after.get("metadata", {})
+    mismatches = []
+    for field in COMPARABLE_METADATA:
+        before_value = before_metadata.get(field)
+        after_value = after_metadata.get(field)
+        if field == "scenario_ids":
+            before_value = sorted(before_value) if isinstance(before_value, list) else before_value
+            after_value = sorted(after_value) if isinstance(after_value, list) else after_value
+        if before_value != after_value:
+            mismatches.append(f"{field}: before={before_value!r}, after={after_value!r}")
+    if mismatches:
+        raise ValueError("Before/after benchmark configuration mismatch: " + "; ".join(mismatches))
     before_summary = before.get("summary", {})
     after_summary = after.get("summary", {})
     rows = []

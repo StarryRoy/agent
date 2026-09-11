@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -32,6 +33,22 @@ def _mean(values: list[int | float | None]) -> float | None:
 def _sum_available(values: list[int | float | None]) -> float | None:
     available = [float(value) for value in values if isinstance(value, (int, float))]
     return sum(available) if available else None
+
+
+def _git_commit() -> str:
+    try:
+        return (
+            subprocess.check_output(
+                ["git", "rev-parse", "HEAD"],
+                cwd=PROJECT_ROOT,
+                text=True,
+                encoding="utf-8",
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            or "N/A"
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "N/A"
 
 
 def _execute_actions(app: Any, scenario: Scenario, session_id: str, response: Any) -> Any:
@@ -110,6 +127,7 @@ def _run_scenario(config: BenchmarkConfig, scenario: Scenario, run_id: str) -> d
                 model=config.model,
                 role_models=config.role_models or None,
                 deterministic=config.deterministic,
+                today=config.benchmark_date,
             )
             for statement in scenario.setup_sql:
                 result = app.database.execute_write(statement)
@@ -260,6 +278,8 @@ def _report_markdown(report: dict[str, Any]) -> str:
         "",
         f"- 测试时间：{meta['started_at']}",
         f"- 使用模型：{meta['model']}",
+        f"- Benchmark 日期：{meta['benchmark_date']}",
+        f"- Git Commit：{meta['git_commit']}",
         f"- 场景数量：{summary['scenario_count']}",
         f"- 成功 / 失败：{summary['passed']} / {summary['failed']}",
         f"- 总 Input / Output Token：{_display(summary['total_input_tokens'])} / {_display(summary['total_output_tokens'])}",
@@ -411,9 +431,12 @@ def main(argv: list[str] | None = None) -> int:
             "finished_at": datetime.now(UTC).isoformat(),
             "model": config.model_label,
             "role_models": config.role_models,
+            "benchmark_date": config.benchmark_date.isoformat(),
+            "git_commit": _git_commit(),
             "real_llm": not config.deterministic,
             "report_kind": "real_llm" if not config.deterministic else "deterministic_debug_only",
             "mcp_enabled": config.enable_mcp,
+            "scenario_ids": [scenario.id for scenario in scenarios],
             "command": "python benchmark/run.py",
         },
         "summary": _summary(cases),

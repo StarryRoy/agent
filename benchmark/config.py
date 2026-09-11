@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -21,12 +22,14 @@ MODEL_ROLES = {
     "risk",
     "execution",
 }
+DEFAULT_BENCHMARK_DATE = date(2026, 9, 11)
 
 
 @dataclass(frozen=True, slots=True)
 class BenchmarkConfig:
     model: str | None
     role_models: dict[str, str]
+    benchmark_date: date
     deterministic: bool
     enable_mcp: bool
     scenario_ids: tuple[str, ...]
@@ -77,6 +80,15 @@ def load_config(argv: list[str] | None = None) -> BenchmarkConfig:
         help="Debug the benchmark only; output is marked ineligible as a real-LLM report",
     )
     parser.add_argument("--without-mcp", action="store_true", help="Disable MCP for diagnosis")
+    parser.add_argument(
+        "--benchmark-date",
+        type=date.fromisoformat,
+        default=date.fromisoformat(
+            os.getenv("PROCUREMENT_BENCHMARK_DATE", DEFAULT_BENCHMARK_DATE.isoformat())
+        ),
+        metavar="YYYY-MM-DD",
+        help=f"Fixed business date for every scenario (default: {DEFAULT_BENCHMARK_DATE})",
+    )
     parser.add_argument("--scenario", action="append", default=[], help="Run only this scenario")
     parser.add_argument(
         "--label", choices=("before", "after"), help="Also save this run as before.json/after.json"
@@ -87,6 +99,7 @@ def load_config(argv: list[str] | None = None) -> BenchmarkConfig:
     config = BenchmarkConfig(
         model=args.model,
         role_models=_role_models(args.role_model),
+        benchmark_date=args.benchmark_date,
         deterministic=args.deterministic,
         enable_mcp=not args.without_mcp,
         scenario_ids=tuple(args.scenario),

@@ -187,6 +187,9 @@ $env:AGENT_HARNESS_MODEL = "provider:model-name"
 ```
 
 每项 Token 和耗时均直接来自 Harness Trace。模型供应商未返回的指标显示为 `N/A`，不会估算。
+所有场景默认固定使用 `2026-09-11` 作为业务日期，并在报告中记录日期与 Git commit；可通过
+`--benchmark-date YYYY-MM-DD` 或 `PROCUREMENT_BENCHMARK_DATE` 覆盖。Before / After 仅在模型、
+角色模型、业务日期、MCP 开关和场景集合一致时生成正式对比。
 
 ### CLI / Python
 
