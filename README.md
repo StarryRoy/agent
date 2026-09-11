@@ -47,6 +47,25 @@ cd D:\Project\agent
 
 ## 快速运行
 
+### 场景 Skill 与业务 Context
+
+`procurement_agent/skills/` 包含 `cost-optimization`、`urgent-procurement`、
+`supplier-risk-review`、`delivery-recovery` 四个采购策略。应用复用 Harness 的
+`SkillLoader`、`LexicalSkillSelector`（`SkillSelector` 实现）和原生 `load_skill`：
+只展示少量候选说明，按当前任务和 Replan 原因加载策略正文，并按 Agent 职责限制候选。
+Session 下一轮会释放未继续使用的 Skill；加载事件记录在现有 Trace 的 `skill.load` 中。
+Skill 负责分析方法，金额、数量、交期、预算与风险计算继续使用现有 Tool。
+
+模型输入中的 SQL 查询包会转换成业务字段和 `evidence`，保留精确数值、约束、方案、
+状态及 `source_ref`。原始 Tool 消息仍由 Harness Checkpoint 保存；需要更多事实时重新
+委派对应分析 Tool 查询。同轮被新分析替代的旧结果不再重复进入模型输入，委派只传所需依赖。
+结构化 `procurement_context` 随子任务进入既有 Session，包含目标、事实、结论、当前方案、
+`budget_gap`、有效预算、风险、Replan 原因与来源；新分析使下游旧结论失效，等待重新核验。
+
+例如预算不足时，保留预算缺口和当前方案，Pricing 加载 `cost-optimization`，以
+`cost_reduction` 调用现有定价 Tool，再由 Budget/Risk 校验新方案。交期和供应商风险采用
+对应策略，继续沿用原有 Replan、MCP 和 HITL 审批。
+
 ### 一键启动
 
 在项目根目录运行：

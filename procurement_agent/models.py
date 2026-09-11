@@ -162,7 +162,10 @@ class DeterministicProcurementModel(BaseChatModel):
             return AIMessage(content=_json({"status": "error", "error": "missing task"}))
         task = _human_text(messages[human_index])
         tool_messages = [
-            message for message in messages[human_index + 1 :] if isinstance(message, ToolMessage)
+            message
+            for message in messages[human_index + 1 :]
+            if isinstance(message, ToolMessage)
+            and message.name in {ROLE_TO_TOOL[self.role], "supplier_status"}
         ]
         primary = ROLE_TO_TOOL[self.role]
         if not tool_messages:

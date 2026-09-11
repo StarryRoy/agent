@@ -14,6 +14,18 @@ class ProcurementState(TypedDict, total=False):
     workflow_version: int
 
 
+class ProcurementAnalysis(BaseModel):
+    """Shared SubAgent envelope; role-specific numeric fields remain structured."""
+
+    model_config = ConfigDict(extra="allow")
+
+    status: str = "success"
+    conclusion: str = ""
+    facts: list[str] = Field(default_factory=list)
+    evidence: list[dict[str, Any]] = Field(default_factory=list)
+    source_ref: dict[str, Any] = Field(default_factory=dict)
+
+
 class ProcurementDecision(BaseModel):
     """Structured result returned by Main Agent."""
 

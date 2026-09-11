@@ -8,6 +8,8 @@ from typing import Any
 
 from agent_harness import AgentMiddleware, EventType, ToolRequest
 
+from .context import task_view
+
 
 class ProcurementOrchestrationMiddleware(AgentMiddleware):
     """Propagate the public Session ID and observe reasoned replanning calls."""
@@ -26,6 +28,12 @@ class ProcurementOrchestrationMiddleware(AgentMiddleware):
             task = dict(raw_task)
         else:
             return
+
+        context = request.execution.metadata.get("procurement_context")
+        if context:
+            # Carry observed facts even if the model omits them from its delegation JSON.
+            task["procurement_context"] = context
+        task = task_view(request.tool.name, task)
 
         if request.tool.name == "execution_agent":
             task["session_id"] = request.execution.session_id
