@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>采购工作台 · Enterprise Procurement Agent</title>
+  <link rel="stylesheet" href="styles.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <header class="topbar"><a class="brand" href="./"><span class="brand-icon">P</span> 采购工作台 <small>AGENT WORKSPACE</small></a><span id="connection" class="connection">连接后端中…</span></header>
+  <main>
+    <div class="page-heading"><div><p class="eyebrow">ENTERPRISE PROCUREMENT</p><h1>从采购需求，到执行落地。</h1><p class="muted">Agent 分析事实、形成方案；关键采购操作由你审批。</p></div><span class="local-badge">本地演示工作区</span></div>
+    <div id="error" class="notice error" role="alert" hidden></div>
+    <div class="workspace">
+      <aside>
+        <section class="card request-card"><div class="section-heading"><h2>发起采购需求</h2><span class="step">01</span></div>
+          <form id="request-form"><label for="request-text">用自然语言描述你的需求</label><textarea id="request-text" rows="6" maxlength="10000" required placeholder="例如：下个月需要采购500台设备，预算80万，月底前必须到货。"></textarea>
+          <button id="example" type="button" class="text-button">填入演示需求 ↗</button><button id="submit" type="submit" class="primary full">开始分析 <span>→</span></button></form>
+          <p class="hint">每次提交创建一个新 Session。修改已有方案请使用右侧审批区。</p>
+        </section>
+        <section class="card"><div class="section-heading"><h2>当前会话</h2><span id="status" class="pill">尚未开始</span></div><p id="session-id" class="mono session-id">—</p><p id="session-message" class="muted">提交需求后，将在此显示任务进度。</p>
+          <form id="restore-form"><label for="restore-id">恢复已有 Session</label><div class="inline"><input id="restore-id" placeholder="purchase-…" aria-label="Session ID" required><button type="submit" class="secondary">查看</button></div></form>
+        </section>
+        <section class="card timeline-card"><div class="section-heading"><h2>Agent 执行过程</h2><span id="event-count" class="counter">0</span></div><p class="hint">Harness 实时事件 · 最近 120 条</p><ol id="timeline" class="timeline" aria-live="polite"><li class="empty-event">等待新任务</li></ol></section>
+      </aside>
+      <div class="content">
+        <section class="card summary-card"><div class="section-heading"><h2>采购分析总览</h2><span class="step">02</span></div><div id="flow" class="flow"><span>提交需求</span><span>Agent 分析</span><span>人工审批</span><span>采购执行</span></div><div id="summary" class="empty-state"><span class="empty-symbol">◎</span><h3>一个需求，串联完整采购流程</h3><p>库存、供应商、报价、预算与风险分析将在此汇总。</p></div></section>
+        <div id="analysis-grid" class="analysis-grid"></div>
+        <section class="card approval-card"><div class="section-heading"><h2>人工审批 · HITL</h2><span class="step">03</span></div><p id="approval-hint" class="muted">有可执行方案时，Agent 会在采购写入前暂停并等待你的决定。</p>
+          <div class="approval-buttons"><button id="approve" class="primary" disabled>批准并执行</button><button id="reject" class="danger-button" disabled>拒绝方案</button></div>
+          <form id="modify-form"><label for="modify-text">修改条件 / 补充需求（继续同一 Session）</label><div class="inline modify-row"><textarea id="modify-text" rows="2" maxlength="10000" required placeholder="例如：把数量改成400台，不要供应商A。"></textarea><button id="modify" class="secondary" type="submit" disabled>修改并继续</button></div></form>
+        </section>
+        <section class="card"><div class="section-heading"><h2>最终采购执行结果</h2><span class="step">04</span></div><div id="result" class="muted">尚未执行采购。</div></section>
+        <section class="card"><div class="section-heading"><h2>Metrics / Trace</h2><button id="refresh-metrics" class="text-button">刷新</button></div><p class="hint">Metrics 为当前后端进程累计值；Trace 来自持久化审计记录。</p><div id="metrics" class="metrics-grid"></div><details><summary>完整 Metrics</summary><pre id="metrics-json">{}</pre></details><details><summary>当前 Session Trace <span id="trace-count"></span></summary><p id="trace-note" class="hint"></p><pre id="trace-json">[]</pre></details></section>
+      </div>
+    </div>
+    <footer>Harness + Multi-Agent · 所有采购判断均由后端返回 · <a id="docs-link" href="http://127.0.0.1:8000/docs" target="_blank" rel="noreferrer">API 文档 ↗</a></footer>
+  </main>
+</body>
+</html>
