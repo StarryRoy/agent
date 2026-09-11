@@ -47,6 +47,19 @@ cd D:\Project\agent
 
 ## 快速运行
 
+### 一键启动
+
+在项目根目录运行：
+
+```powershell
+.\.venv\Scripts\python.exe run.py
+```
+
+启动器会弹出模式选择窗口。Demo 模式直接使用确定性模型且无需 API Key；Real 模式沿用现有
+`AGENT_HARNESS_MODEL` 及 Provider 环境变量配置。选择后会自动启动 FastAPI 和前端静态服务，
+并打开浏览器；在启动窗口按 `Ctrl+C` 会尽量正常停止两个子进程。可用
+`PROCUREMENT_BACKEND_PORT` 和 `PROCUREMENT_FRONTEND_PORT` 调整端口。
+
 ### Web 演示（FastAPI + 独立前端）
 
 安装上述 `requirements.txt` 后，在项目根目录打开两个 PowerShell 终端。
