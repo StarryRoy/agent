@@ -165,6 +165,29 @@ Trace 读取直接利用现有 JSONL 文件，适合本地演示；长期大量�
 .\.venv\Scripts\python.exe -m pytest tests/test_web_api.py
 ```
 
+### 真实 LLM Benchmark
+
+配置原项目使用的真实模型后，一条命令会执行固定采购场景并生成可追溯的 JSON、CSV、Markdown
+报告以及逐场景 JSONL Trace：
+
+```powershell
+$env:AGENT_HARNESS_MODEL = "provider:model-name"
+.\.venv\Scripts\python.exe benchmark/run.py
+```
+
+结果写入 `benchmark/results/`，可读报告写入 `benchmark/reports/`。使用
+`--label before` 和 `--label after` 保存两个版本的基准数据；当两份数据同时存在时，后续报告
+会自动增加 Before / After 对比。`--role-model role=provider:model` 继续复用工厂现有的
+`role_models` 配置。`--deterministic` 仅用于调试评测模块，生成结果会明确标记为非真实 LLM，
+且不能进入正式版本对比。
+
+```powershell
+.\.venv\Scripts\python.exe benchmark/run.py --label before
+.\.venv\Scripts\python.exe benchmark/run.py --label after
+```
+
+每项 Token 和耗时均直接来自 Harness Trace。模型供应商未返回的指标显示为 `N/A`，不会估算。
+
 ### CLI / Python
 
 正式运行前传入 LangChain 模型对象，或按 Harness 公开配置设置模型。例如，安装所选模型的
