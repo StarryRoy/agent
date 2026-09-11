@@ -47,6 +47,94 @@ cd D:\Project\agent
 
 ## 快速运行
 
+### Web 演示（FastAPI + 独立前端）
+
+安装上述 `requirements.txt` 后，在项目根目录打开两个 PowerShell 终端。
+以下命令使用明确启用的离线确定性演示模型，无需 API Key：
+
+```powershell
+# 终端 1：后端，沿用已有数据库与 Harness Checkpoint，不重置数据
+cd D:\Project\agent
+$env:PROCUREMENT_DEMO = "1"
+.\.venv\Scripts\python.exe -m uvicorn backend.app:app --host 127.0.0.1 --port 8000
+
+# 终端 2：前端，无需 Node.js 或构建步骤
+cd D:\Project\agent
+.\.venv\Scripts\python.exe -m http.server 5173 --bind 127.0.0.1 --directory frontend
+```
+
+打开 [采购工作台](http://127.0.0.1:5173)，点击“填入演示需求”，再点击“开始分析”。
+页面显示真实 Harness 事件、库存/供应商/价格/预算/风险分析，以及推荐和备选方案。
+待状态变为“等待审批”，可选择批准执行、拒绝，或输入“把数量改成400台，不要供应商A。”
+后修改并继续。修改复用同一 Session，再次审批才会执行新方案。
+浏览器保存最近的 Session ID；刷新或重启后端后也可输入该 ID 恢复查看和审批。
+
+正式模型模式须移除演示标志并配置原应用所需的模型及对应 provider：
+
+```powershell
+Remove-Item Env:PROCUREMENT_DEMO -ErrorAction SilentlyContinue
+$env:AGENT_HARNESS_MODEL = "provider:model-name"
+.\.venv\Scripts\python.exe -m uvicorn backend.app:app --host 127.0.0.1 --port 8000
+```
+
+配置项：`PROCUREMENT_DATA_DIR` 指定数据目录（默认 `data`）；`PROCUREMENT_MCP=0`
+仅用于关闭外部供应商 MCP 的离线测试（默认启用）；`PROCUREMENT_CORS_ORIGINS` 为逗号分隔的
+前端来源，默认允许 `http://127.0.0.1:5173` 和 `http://localhost:5173`。
+前端默认连接 `http://127.0.0.1:8000`；连接其他本地端口可使用
+`http://127.0.0.1:5173/?api=http://127.0.0.1:8001`。
+
+此入口用于本地演示，绑定回环地址，无登录与租户权限层。后端使用单个 worker，HTTP 操作在
+共享应用实例上串行执行；不要使用 `--workers` 多进程共享该实例的数据目录。浏览器断开 SSE
+不会取消采购，正常关闭服务会等待已接受操作完成。进程被强行终止时，Checkpoint 和 Trace
+仍保留；未完成且未处于 HITL 暂停的任务显示“执行中断”，不会被当作采购成功。
+
+### Web 工程结构与 API
+
+`backend/app.py` 定义生命周期、REST 路由和 SSE；`backend/schemas.py` 定义 HTTP 契约；
+`backend/adapter.py` 调用现有应用并转换传输数据；`frontend/` 是原生 HTML/CSS/JavaScript
+页面和 API client。`procurement_agent` 核心未修改。接口只以 `session_id` 标识会话，
+不会返回 `thread_id`、Checkpoint 配置或原始 HITL interrupt。
+
+REST 前缀为 `/api/v1`，交互式契约见 [FastAPI API 文档](http://127.0.0.1:8000/docs)：
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| GET | `/health` | 服务状态及演示/配置模型模式 |
+| POST | `/sessions` | `{"text":"采购需求"}`，返回 202、Session ID 与 events URL |
+| GET | `/sessions/{session_id}` | 当前状态、结构化方案及 trace_id |
+| POST | `/sessions/{session_id}/approve` | 批准待审批方案，返回 202 |
+| POST | `/sessions/{session_id}/reject` | 拒绝待审批方案，返回 202 |
+| POST | `/sessions/{session_id}/modify` | `{"text":"修改条件"}`，同一 Session 继续，返回 202 |
+| GET | `/sessions/{session_id}/result` | 最终结果；仍执行中或待审批时返回 409 |
+| GET | `/sessions/{session_id}/events` | SSE 执行事件与业务状态快照 |
+| GET | `/sessions/{session_id}/trace?limit=500` | 持久化 Trace，最大 2000 条，返回截断标志 |
+| GET | `/metrics` | 当前服务进程累计 Metrics，服务重启后重新累计 |
+
+未知 Session 返回 404，输入校验失败返回 422；同一 Session 正在执行或审批状态不匹配时
+返回 409。每次 `POST /sessions` 创建新 Session，客户端不应自动重试该请求。
+状态包括 `running`、`approval_required`、`completed`、`error` 和 `interrupted`。
+`completed` 代表 Agent 已完成处理；实际是否采购成功需读取后端 `data.execution_status`，
+可能是 `success`、`not_required`、`blocked`、`failed` 或 `not_started`。
+
+SSE 事件包括 `progress`（真实执行事件）、`snapshot`（REST 同形结构化状态）、`done`
+（本轮操作结束，应关闭连接）和 `reset`（回放缓冲过期，读取 Trace）。支持 `Last-Event-ID`
+或 `after` 游标；每个 Session 内存中最多保留 1000 条传输事件，最多保留 100 个近期 Session
+的回放缓冲。服务重启后通过 Checkpoint 恢复方案，通过 Trace 恢复历史。
+
+初次提交使用现有 `ProcurementApplication.astream()`；审批/修改使用
+`aapprove/areject/amodify`，将原有 Observer 审计事件转发为 SSE。Harness 当前没有公开的
+状态查询接口，因此适配器的 `_checkpoint_result` 集中使用现有 runtime 的配置解析和 Agent
+结果转换方法读取 Checkpoint，再复用 `ProcurementApplication._convert`。这是需要在升级
+Harness 时运行 Web 回归测试的兼容点，没有复制 Session、采购业务或 HITL 逻辑。
+Trace 读取直接利用现有 JSONL 文件，适合本地演示；长期大量运行时应另行增加日志索引和轮转。
+
+```powershell
+# Web API 回归：真实 Harness、SQLite 和确定性模型，无外部模型消耗
+.\.venv\Scripts\python.exe -m pytest tests/test_web_api.py
+```
+
+### CLI / Python
+
 正式运行前传入 LangChain 模型对象，或按 Harness 公开配置设置模型。例如，安装所选模型的
 LangChain provider 后：
 
