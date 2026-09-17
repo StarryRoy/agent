@@ -32,6 +32,7 @@ def create_app(
     async def lifespan(api: FastAPI):
         application = await create_procurement_app_async(
             data_dir=root,
+            reset_database=True,
             deterministic=demo,
             enable_mcp=mcp,
         )

@@ -148,10 +148,13 @@ async def create_procurement_app_async(
     checkpoint_path = root / "checkpoints.sqlite"
     if reset_database and checkpoint_path.exists():
         checkpoint_path.unlink()
+    trace_path = root / "traces.jsonl"
+    if reset_database and trace_path.exists():
+        trace_path.unlink()
 
     checkpointer = PersistentSQLiteSaver(checkpoint_path)
     metric_sink = ProcurementMetricSink()
-    event_sink = JsonLinesEventSink(root / "traces.jsonl")
+    event_sink = JsonLinesEventSink(trace_path)
     sinks = [metric_sink, event_sink]
     database = ObservedDatabaseToolkit(
         backend=ProcurementSQLiteBackend(SQLiteConfig(database=business_path)),
