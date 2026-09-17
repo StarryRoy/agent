@@ -38,7 +38,7 @@ Pricing，再校验 Budget/Risk。已确认且不受修改影响的结果从同�
 
 ## 安装
 
-项目虚拟环境已经以 editable 方式引用本地 Harness。重新安装可执行：
+项目依赖 Harness 仓库的 `codex` 分支；重新安装可执行：
 
 ```powershell
 cd D:\Project\agent

@@ -129,8 +129,8 @@ async def create_procurement_app_async(
         timeout_seconds=30,
         call_limit=16,
         context_policy=ContextPolicy(
-            summary_threshold=80,
             summary_token_threshold=24_000,
+            model_max_input_tokens=128_000,
             summary_keep_recent=16,
             max_skill_candidates=2,
             skill_retention_turns=0,
@@ -143,8 +143,8 @@ async def create_procurement_app_async(
         timeout_seconds=60,
         call_limit=48,
         context_policy=ContextPolicy(
-            summary_threshold=160,
             summary_token_threshold=64_000,
+            model_max_input_tokens=128_000,
             summary_keep_recent=32,
             max_tool_results=24,
             max_tool_result_chars=50_000,
