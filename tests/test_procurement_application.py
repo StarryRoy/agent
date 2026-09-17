@@ -7,6 +7,7 @@ import pytest
 from langchain_core.language_models import FakeListChatModel
 
 from procurement_agent import create_procurement_app
+from procurement_agent import factory as factory_module
 from procurement_agent.evaluation import run_evaluation
 from procurement_agent.models import DeterministicProcurementModel
 from procurement_agent.services import ProcurementServices
@@ -240,6 +241,102 @@ def test_production_factory_uses_explicit_configured_model(tmp_path):
             assert query_tool.func.__self__ is application.database
             assert related_table in definition.instructions
             assert unrelated_table not in definition.instructions
+    finally:
+        application.close()
+
+
+def test_production_factory_creates_one_default_gemini_for_all_agents(
+    tmp_path, monkeypatch
+):
+    default_model = BindableFakeChatModel(responses=["{}"])
+    constructor_calls = []
+
+    def create_gemini(**kwargs):
+        constructor_calls.append(kwargs)
+        return default_model
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.setattr(factory_module, "ChatGoogleGenerativeAI", create_gemini)
+
+    application = create_procurement_app(
+        data_dir=tmp_path,
+        reset_database=True,
+        enable_mcp=False,
+    )
+    try:
+        assert constructor_calls == [
+            {
+                "model": factory_module.GEMINI_MODEL_NAME,
+                "api_key": "test-gemini-key",
+                "thinking_budget": 0,
+            }
+        ]
+        assert application.agent.definition.model is default_model
+        assert application.agent.definition.runtime_config.timeout_seconds == 90
+        assert all(
+            subagent.definition.model is default_model
+            for subagent in application.agent._subagents.values()
+        )
+        assert all(
+            subagent.definition.runtime_config.timeout_seconds == 60
+            for subagent in application.agent._subagents.values()
+        )
+    finally:
+        application.close()
+
+
+def test_role_model_overrides_default_gemini_only_for_its_role(tmp_path, monkeypatch):
+    default_model = BindableFakeChatModel(responses=["{}"])
+    supplier_model = BindableFakeChatModel(responses=["{}"])
+    constructor_calls = []
+
+    def create_gemini(**kwargs):
+        constructor_calls.append(kwargs)
+        return default_model
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.setattr(factory_module, "ChatGoogleGenerativeAI", create_gemini)
+
+    application = create_procurement_app(
+        data_dir=tmp_path,
+        reset_database=True,
+        enable_mcp=False,
+        role_models={"supplier": supplier_model},
+    )
+    try:
+        assert len(constructor_calls) == 1
+        assert application.agent._subagents["supplier_agent"].definition.model is supplier_model
+        assert application.agent._subagents["inventory_agent"].definition.model is default_model
+        assert application.agent.definition.model is default_model
+    finally:
+        application.close()
+
+
+def test_real_mode_without_model_or_gemini_key_fails_clearly(tmp_path, monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+
+    with pytest.raises(RuntimeError, match="GEMINI_API_KEY"):
+        create_procurement_app(
+            data_dir=tmp_path,
+            reset_database=True,
+            enable_mcp=False,
+        )
+
+
+def test_deterministic_mode_never_constructs_gemini(tmp_path, monkeypatch):
+    def unexpected_gemini(**kwargs):
+        raise AssertionError(f"Gemini should not be created in deterministic mode: {kwargs}")
+
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setattr(factory_module, "ChatGoogleGenerativeAI", unexpected_gemini)
+    application = create_procurement_app(
+        data_dir=tmp_path,
+        reset_database=True,
+        enable_mcp=False,
+        deterministic=True,
+    )
+    try:
+        assert isinstance(application.agent.definition.model, DeterministicProcurementModel)
     finally:
         application.close()
 

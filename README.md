@@ -4,8 +4,11 @@
 供应商、价格、预算、风险与执行七个 SubAgent；采购写操作由 Execution Agent 发起，并由
 Harness 原生 HITL 在持久化 Checkpoint 上暂停和恢复。
 
-正式应用由真实、可配置的 LangChain `BaseChatModel` 驱动 Harness Agent/Tool 循环。Main
-Agent 根据会话证据动态选择和协调 SubAgent；项目不会在未配置模型时隐式退回 Python 规则。
+正式应用默认由 `langchain-google-genai` 的 `ChatGoogleGenerativeAI` 驱动 Harness
+Agent/Tool 循环，模型集中配置为 `gemini-3.5-flash-lite`，并通过 `thinking_budget=0` 关闭思考；
+API Key 只从系统环境变量 `GEMINI_API_KEY` 读取。Main Agent 根据会话证据动态选择和协调
+SubAgent；显式传入的 `model` 或 `role_models` 仍可覆盖默认模型，项目不会在未配置 Key 时隐式
+退回 Python 规则。SubAgent 单次运行超时为 60 秒，Main Agent 为 90 秒。
 确定性 `DeterministicProcurementModel` 仅通过 `deterministic=True` 或 CLI 的
 `--deterministic` 显式启用，专用于离线回归和异常注入；该模式的查询由同名 Mock Tool 返回
 契约化 rows，不保存测试查询 SQL。正式模式的查询全部由 LLM 根据当前 Skill、Schema 和
@@ -79,12 +82,14 @@ Skill。加载事件记录在现有 Trace 的 `skill.load` 中。
 在项目根目录运行：
 
 ```powershell
+$env:GEMINI_API_KEY = "your-gemini-api-key"
 .\.venv\Scripts\python.exe run.py
 ```
 
-启动器会弹出模式选择窗口。Demo 模式直接使用确定性模型且无需 API Key；Real 模式沿用现有
-`AGENT_HARNESS_MODEL` 及 Provider 环境变量配置。选择后会自动启动 FastAPI 和前端静态服务，
-并打开浏览器；在启动窗口按 `Ctrl+C` 会尽量正常停止两个子进程。可用
+启动器会弹出模式选择窗口。Demo 模式直接使用确定性模型且无需 API Key；Real 模式默认使用
+`gemini-3.5-flash-lite`（关闭思考）和 `GEMINI_API_KEY`，无需额外配置 Harness 默认模型。
+选择后会自动启动 FastAPI 和前端静态服务，并打开浏览器；在启动窗口按 `Ctrl+C` 会尽量正常
+停止两个子进程。可用
 `PROCUREMENT_BACKEND_PORT` 和 `PROCUREMENT_FRONTEND_PORT` 调整端口。
 
 ### Web 演示（FastAPI + 独立前端）
@@ -109,11 +114,11 @@ cd D:\Project\agent
 后修改并继续。修改复用同一 Session，再次审批才会执行新方案。
 浏览器保存最近的 Session ID；刷新或重启后端后也可输入该 ID 恢复查看和审批。
 
-正式模型模式须移除演示标志并配置原应用所需的模型及对应 provider：
+正式模型模式须移除演示标志并配置 Gemini API Key：
 
 ```powershell
 Remove-Item Env:PROCUREMENT_DEMO -ErrorAction SilentlyContinue
-$env:AGENT_HARNESS_MODEL = "provider:model-name"
+$env:GEMINI_API_KEY = "your-gemini-api-key"
 .\.venv\Scripts\python.exe -m uvicorn backend.app:app --host 127.0.0.1 --port 8000
 ```
 
@@ -175,11 +180,11 @@ Trace 读取直接利用现有 JSONL 文件，适合本地演示；长期大量�
 
 ### 真实 LLM Benchmark
 
-配置原项目使用的真实模型后，一条命令会执行固定采购场景并生成可追溯的 JSON、CSV、Markdown
+配置 Gemini API Key 后，一条命令会执行固定采购场景并生成可追溯的 JSON、CSV、Markdown
 报告以及逐场景 JSONL Trace：
 
 ```powershell
-$env:AGENT_HARNESS_MODEL = "provider:model-name"
+$env:GEMINI_API_KEY = "your-gemini-api-key"
 .\.venv\Scripts\python.exe benchmark/run.py
 ```
 
@@ -201,15 +206,15 @@ $env:AGENT_HARNESS_MODEL = "provider:model-name"
 
 ### CLI / Python
 
-正式运行前传入 LangChain 模型对象，或按 Harness 公开配置设置模型。例如，安装所选模型的
-LangChain provider 后：
+正式运行默认使用应用层统一创建的 Gemini 模型：
 
 ```powershell
-$env:AGENT_HARNESS_MODEL = "provider:model-name"
+$env:GEMINI_API_KEY = "your-gemini-api-key"
 .\.venv\Scripts\python.exe main.py --data-dir .\data demo --approve --session demo-001
 ```
 
-也可以使用 `--model provider:model-name`。完整离线验收示例必须显式启用测试 Mock：
+外部显式传入 `model`、`role_models` 或使用 `--model provider:model-name` 时会优先使用覆盖值；
+未覆盖的角色才使用默认 Gemini。完整离线验收示例必须显式启用测试 Mock：
 
 ```powershell
 .\.venv\Scripts\python.exe main.py --data-dir .\data --deterministic demo --approve --session demo-001
@@ -218,8 +223,8 @@ $env:AGENT_HARNESS_MODEL = "provider:model-name"
 分步操作：
 
 ```powershell
-.\.venv\Scripts\python.exe main.py --model provider:model-name request "下个月需要采购500台设备，预算80万，月底前必须到货。" --session buy-001
-.\.venv\Scripts\python.exe main.py --model provider:model-name approve buy-001
+.\.venv\Scripts\python.exe main.py request "下个月需要采购500台设备，预算80万，月底前必须到货。" --session buy-001
+.\.venv\Scripts\python.exe main.py approve buy-001
 ```
 
 也可以在审批前修改；应用会拒绝旧的待执行 Tool Call，保留先前证据，再只重跑受影响部分：
@@ -238,12 +243,9 @@ $env:AGENT_HARNESS_MODEL = "provider:model-name"
 Python API：
 
 ```python
-from langchain_openai import ChatOpenAI
-
 from procurement_agent import create_procurement_app
 
-model = ChatOpenAI(model="your-approved-model")
-with create_procurement_app(data_dir="data", model=model) as app:
+with create_procurement_app(data_dir="data") as app:
     proposal = app.submit(
         "下个月需要采购500台设备，预算80万，月底前必须到货。",
         session_id="buy-001",

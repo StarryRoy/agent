@@ -1,8 +1,8 @@
 """One-click launcher for the procurement web demo.
 
 Run ``python run.py`` from the project root.  The small Tk window chooses
-between the existing deterministic model and the configured real LLM, then
-starts the API and static frontend in child processes.
+between the existing deterministic model and the application-owned Gemini
+model, then starts the API and static frontend in child processes.
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ import time
 import urllib.request
 import webbrowser
 from pathlib import Path
-
 
 ROOT = Path(__file__).resolve().parent
 BACKEND_PORT = int(os.getenv("PROCUREMENT_BACKEND_PORT", "8000"))
@@ -40,7 +39,7 @@ def choose_mode() -> bool:
     tk.Button(buttons, text="Demo 模式（无需 API Key）", width=25, command=lambda: select(True)).pack(
         pady=4
     )
-    tk.Button(buttons, text="Real 模式（使用环境变量）", width=25, command=lambda: select(False)).pack(
+    tk.Button(buttons, text="Real 模式（Gemini）", width=25, command=lambda: select(False)).pack(
         pady=4
     )
     window.protocol("WM_DELETE_WINDOW", window.destroy)
@@ -84,6 +83,8 @@ def main() -> int:
         environment["PROCUREMENT_DEMO"] = "1"
     else:
         environment.pop("PROCUREMENT_DEMO", None)
+        if not environment.get("GEMINI_API_KEY"):
+            raise SystemExit("Real 模式需要先设置 GEMINI_API_KEY 环境变量。")
 
     processes: list[subprocess.Popen] = []
     try:

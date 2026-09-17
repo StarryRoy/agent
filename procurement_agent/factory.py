@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from collections.abc import Mapping
 from datetime import UTC, date, datetime
@@ -20,6 +21,7 @@ from agent_harness import (
     load_mcp_tools,
 )
 from langchain_core.language_models import BaseChatModel
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 from .application import ProcurementApplication
 from .context import ProcurementContextMiddleware
@@ -34,6 +36,32 @@ from .skill_policy import ProcurementSkillMiddleware
 from .sql_catalog import role_database_context
 
 _MCP_TOOL_CACHE: list[Any] | None = None
+GEMINI_MODEL_NAME = "gemini-3.5-flash-lite"
+GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
+AGENT_ROLES = (
+    "requirement",
+    "inventory",
+    "supplier",
+    "pricing",
+    "budget",
+    "risk",
+    "execution",
+    "main",
+)
+
+
+def _create_gemini_model() -> ChatGoogleGenerativeAI:
+    api_key = os.getenv(GEMINI_API_KEY_ENV)
+    if not api_key:
+        raise RuntimeError(
+            f"Real mode requires the {GEMINI_API_KEY_ENV} environment variable. "
+            "Set it before starting the application, or pass model/role_models explicitly."
+        )
+    return ChatGoogleGenerativeAI(
+        model=GEMINI_MODEL_NAME,
+        api_key=api_key,
+        thinking_budget=0,
+    )
 
 
 async def _supplier_mcp_tools() -> list[Any]:
@@ -97,13 +125,22 @@ async def create_procurement_app_async(
 ) -> ProcurementApplication:
     """Create the application.
 
-    Production callers configure a real model through ``model``, ``role_models``,
-    Harness' configured default, or ``AGENT_HARNESS_MODEL``. The deterministic
-    model is an explicit test double and is never the formal default.
+    Real mode defaults to one application-owned Gemini model. Explicit ``model``
+    and ``role_models`` values override that default. The deterministic model is
+    an explicit test double and never creates or calls Gemini.
     """
 
     if deterministic and (model is not None or role_models):
         raise ValueError("deterministic test mode cannot be combined with configured LLMs")
+
+    configured_roles = dict(role_models or {})
+    default_model = model
+    if (
+        not deterministic
+        and default_model is None
+        and any(role not in configured_roles for role in AGENT_ROLES)
+    ):
+        default_model = _create_gemini_model()
 
     root = Path(data_dir).resolve() if data_dir else Path(__file__).resolve().parents[1] / "data"
     root.mkdir(parents=True, exist_ok=True)
@@ -133,7 +170,7 @@ async def create_procurement_app_async(
     sub_config = RuntimeConfig(
         max_iterations=8,
         retry_attempts=2,
-        timeout_seconds=30,
+        timeout_seconds=60,
         call_limit=16,
         context_policy=ContextPolicy(
             summary_token_threshold=24_000,
@@ -147,7 +184,7 @@ async def create_procurement_app_async(
     main_config = RuntimeConfig(
         max_iterations=20,
         retry_attempts=2,
-        timeout_seconds=60,
+        timeout_seconds=90,
         call_limit=48,
         context_policy=ContextPolicy(
             summary_token_threshold=64_000,
@@ -171,7 +208,6 @@ async def create_procurement_app_async(
         "risk": "calculate_risk",
         "execution": "execute_procurement_plan",
     }
-    configured_roles = dict(role_models or {})
     skill_root = Path(__file__).with_name("skills")
     skills = [SkillLoader().load(path) for path in sorted(skill_root.iterdir()) if path.is_dir()]
     selector = LexicalSkillSelector()
@@ -195,7 +231,7 @@ async def create_procurement_app_async(
     def model_for(role: str) -> BaseChatModel | str | None:
         if deterministic:
             return DeterministicProcurementModel(role=role)
-        return configured_roles.get(role, model)
+        return configured_roles.get(role, default_model)
 
     for role in ("requirement", "inventory", "supplier", "pricing", "budget", "risk", "execution"):
         selected_skills = [skill for skill in skills if skill.name in role_skills[role]]
