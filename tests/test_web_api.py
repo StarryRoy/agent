@@ -11,6 +11,15 @@ from backend.app import create_app
 REQUEST = "下个月需要采购500台设备，预算80万，月底前必须到货。"
 
 
+def inserted_rows(application, table):
+    prefix = f'INSERT INTO "{table}"'
+    return [
+        line
+        for line in application.database.backend._connection.iterdump()
+        if line.startswith(prefix)
+    ]
+
+
 @pytest.fixture
 def client(tmp_path):
     with TestClient(create_app(data_dir=tmp_path, deterministic=True, enable_mcp=False)) as http:
@@ -85,8 +94,8 @@ def test_modify_same_session_then_reject_never_writes(client):
     rejected = wait(client, sid)
     assert rejected["data"]["approval_status"] == "rejected"
     application = client.app.state.adapter.application
-    assert application.database.execute_query("SELECT id FROM purchase_requests")["row_count"] == 0
-    assert application.database.execute_query("SELECT id FROM purchase_orders")["row_count"] == 0
+    assert inserted_rows(application, "purchase_requests") == []
+    assert inserted_rows(application, "purchase_orders") == []
 
 
 def test_checkpoint_query_and_approval_survive_backend_restart(tmp_path):

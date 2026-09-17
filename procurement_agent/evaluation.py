@@ -39,11 +39,13 @@ _ALL_SUBAGENTS = {
 }
 _ALL_TOOLS = _ALL_SUBAGENTS | {
     "parse_requirement",
-    "analyze_inventory",
-    "analyze_suppliers",
-    "analyze_pricing",
-    "analyze_budget",
-    "analyze_risk",
+    "load_skill",
+    "execute_query",
+    "calculate_inventory",
+    "calculate_suppliers",
+    "calculate_pricing",
+    "calculate_budget",
+    "calculate_risk",
     "execute_procurement_plan",
     "supplier_status",
 }
@@ -60,16 +62,21 @@ _NORMAL_TOOLS = [
     "requirement_agent",
     "parse_requirement",
     "inventory_agent",
-    "analyze_inventory",
+    "execute_query",
+    "calculate_inventory",
     "supplier_agent",
-    "analyze_suppliers",
+    "execute_query",
+    "calculate_suppliers",
     "supplier_status",
     "pricing_agent",
-    "analyze_pricing",
+    "execute_query",
+    "calculate_pricing",
     "budget_agent",
-    "analyze_budget",
+    "execute_query",
+    "calculate_budget",
     "risk_agent",
-    "analyze_risk",
+    "execute_query",
+    "calculate_risk",
     "execution_agent",
 ]
 
@@ -77,11 +84,16 @@ _NORMAL_TOOLS = [
 def _route_profile(name: str) -> tuple[list[str], list[str]]:
     pair = {
         "requirement_agent": ["requirement_agent", "parse_requirement"],
-        "inventory_agent": ["inventory_agent", "analyze_inventory"],
-        "supplier_agent": ["supplier_agent", "analyze_suppliers", "supplier_status"],
-        "pricing_agent": ["pricing_agent", "analyze_pricing"],
-        "budget_agent": ["budget_agent", "analyze_budget"],
-        "risk_agent": ["risk_agent", "analyze_risk"],
+        "inventory_agent": ["inventory_agent", "execute_query", "calculate_inventory"],
+        "supplier_agent": [
+            "supplier_agent",
+            "execute_query",
+            "calculate_suppliers",
+            "supplier_status",
+        ],
+        "pricing_agent": ["pricing_agent", "execute_query", "calculate_pricing"],
+        "budget_agent": ["budget_agent", "execute_query", "calculate_budget"],
+        "risk_agent": ["risk_agent", "execute_query", "calculate_risk"],
     }
     profiles = {
         "normal": _NORMAL_SUBAGENTS,
@@ -239,8 +251,11 @@ def _check(
             )
 
     actual_tools = list(metrics.get("tool_route") or [])
-    if expected_tool_route is not None and actual_tools != expected_tool_route:
-        fail("tool_use", f"expected tool route {expected_tool_route!r}; got {actual_tools!r}")
+    # Skill loading is a required Harness control step but may occur on Main or a
+    # SubAgent depending on the scenario. Compare business Tool routing separately.
+    routed_tools = [name for name in actual_tools if name != "load_skill"]
+    if expected_tool_route is not None and routed_tools != expected_tool_route:
+        fail("tool_use", f"expected tool route {expected_tool_route!r}; got {routed_tools!r}")
     for tool_name in scenario.get("expected_tools", []):
         if tool_name not in actual_tools:
             fail("tool_use", f"required tool was not used: {tool_name}")
@@ -274,6 +289,7 @@ def _check(
 
     allowed_subagents = set(scenario.get("allowed_subagents") or expected_route or _ALL_SUBAGENTS)
     allowed_tools = set(scenario.get("allowed_tools") or expected_tool_route or _ALL_TOOLS)
+    allowed_tools.add("load_skill")
     invalid_subagent_calls = max(
         sum(name not in allowed_subagents for name in actual_route),
         0,
@@ -288,11 +304,11 @@ def _check(
     invalid_tool_calls = max(
         sum(name not in allowed_tools for name in actual_tools),
         0,
-        len(actual_tools)
+        len(routed_tools)
         - int(
             scenario.get(
                 "max_tool_calls",
-                len(expected_tool_route) if expected_tool_route is not None else len(actual_tools),
+                len(expected_tool_route) if expected_tool_route is not None else len(routed_tools),
             )
         ),
     )

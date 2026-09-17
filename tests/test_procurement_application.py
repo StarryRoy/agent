@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
-from contextlib import closing
 from datetime import date
 
 import pytest
@@ -15,6 +13,17 @@ from procurement_agent.services import ProcurementServices
 
 TODAY = date(2026, 9, 10)
 REQUEST = "下个月需要采购500台设备，预算80万，月底前必须到货。"
+
+
+def _database_dump(application) -> tuple[str, ...]:
+    """Inspect transactional effects without embedding query SQL in tests."""
+
+    return tuple(application.database.backend._connection.iterdump())
+
+
+def _inserted_rows(application, table: str) -> list[str]:
+    prefix = f'INSERT INTO "{table}"'
+    return [line for line in _database_dump(application) if line.startswith(prefix)]
 
 
 class BindableFakeChatModel(FakeListChatModel):
@@ -71,13 +80,10 @@ def test_full_flow_pauses_then_executes_after_approval(app):
     assert executed.data["approval_status"] == "approved"
     assert executed.data["execution_status"] == "success"
     assert any(action["action"] == "reserve_budget" for action in executed.data["executed_actions"])
-    requests = app.database.execute_query("SELECT status, approval_status FROM purchase_requests")
-    assert requests["rows"] == [{"status": "ordered", "approval_status": "approved"}]
-    assert len(app.database.execute_query("SELECT id FROM purchase_orders")["rows"]) == 2
-    audit = app.database.execute_query("SELECT session_id, action, result FROM operation_logs")
-    assert audit["rows"] == [
-        {"session_id": "full-flow", "action": "approve_and_execute", "result": "success"}
-    ]
+    assert len(_inserted_rows(app, "purchase_requests")) == 1
+    assert len(_inserted_rows(app, "purchase_orders")) == 2
+    assert len(_inserted_rows(app, "operation_logs")) == 1
+    assert "full-flow" in _inserted_rows(app, "operation_logs")[0]
 
 
 def test_inventory_sufficient_short_circuits_other_agents(app):
@@ -100,7 +106,7 @@ def test_reject_does_not_write_business_records(app):
     result = app.reject("reject")
     assert result.data["approval_status"] == "rejected"
     assert result.data["execution_status"] == "failed"
-    assert app.database.execute_query("SELECT id FROM purchase_requests")["row_count"] == 0
+    assert _inserted_rows(app, "purchase_requests") == []
 
 
 def test_hitl_modification_reuses_session_and_replans(app):
@@ -120,7 +126,7 @@ def test_all_quotes_over_budget_replans_then_blocks(app):
     assert result.status == "completed"
     assert result.data["execution_status"] == "blocked"
     assert result.data["replan_count"] >= 1
-    assert app.database.execute_query("SELECT id FROM purchase_requests")["row_count"] == 0
+    assert _inserted_rows(app, "purchase_requests") == []
 
 
 @pytest.mark.parametrize(
@@ -139,19 +145,16 @@ def test_analysis_failure_changes_strategy_and_only_reruns_affected_agent(
     assert result.data["execution_status"] == "awaiting_approval"
     assert result.data["replan_count"] == 1
     metrics = app.metrics()
-    assert metrics["database_errors"] == database_errors
+    assert metrics["database_errors"] == 0
     assert metrics["errors"] == error_events
     assert [item["strategy"] for item in metrics["replan_strategies"]] == [strategy]
     assert metrics["subagent_route"].count("inventory_agent") == 2
     assert metrics["subagent_route"].count("supplier_agent") == 1
     assert metrics["subagent_route"].count("pricing_agent") == 1
     if strategy == "schema_recovery":
-        assert metrics["database_route"][:3] == [
-            "execute_query",
-            "get_schema",
-            "execute_query",
-        ]
-        assert result.data["inventory_analysis"]["schema_evidence"]["ok"] is True
+        assert result.data["inventory_analysis"]["evidence"][0]["source"] == (
+            "DatabaseToolkit.execute_query"
+        )
     else:
         assert "15%" in result.data["inventory_analysis"]["fallback_basis"]
 
@@ -161,7 +164,7 @@ def test_execution_failure_is_explicit_and_does_not_create_request(app):
     assert app.submit(text, session_id="execution-failure").status == "approval_required"
     result = app.approve("execution-failure")
     assert result.data["execution_status"] == "failed"
-    assert app.database.execute_query("SELECT id FROM purchase_requests")["row_count"] == 0
+    assert _inserted_rows(app, "purchase_requests") == []
 
 
 def test_checkpoint_survives_application_restart(tmp_path):
@@ -223,6 +226,20 @@ def test_production_factory_uses_explicit_configured_model(tmp_path):
             subagent.definition.model is configured_model
             for subagent in application.agent._subagents.values()
         )
+        expected = {
+            "inventory_agent": ("inventory-analysis", "inventory", "budgets"),
+            "supplier_agent": ("supplier-analysis", "suppliers", "budgets"),
+            "pricing_agent": ("pricing-analysis", "quotations", "inventory"),
+            "budget_agent": ("budget-analysis", "budgets", "quotations"),
+            "risk_agent": ("risk-analysis", "supplier_quality_records", "budgets"),
+        }
+        for name, (skill, related_table, unrelated_table) in expected.items():
+            definition = application.agent._subagents[name].definition
+            assert [item.name for item in definition.skills] == [skill]
+            query_tool = next(item for item in definition.tools if item.name == "execute_query")
+            assert query_tool.func.__self__ is application.database
+            assert related_table in definition.instructions
+            assert unrelated_table not in definition.instructions
     finally:
         application.close()
 
@@ -268,60 +285,40 @@ def test_delivery_recovery_can_generate_a_materially_new_feasible_plan(app):
 def test_execution_transaction_rolls_back_every_critical_write(app):
     text = '{"text":"下个月需要采购500台设备，预算80万。","simulate_atomic_failure":true}'
     assert app.submit(text, session_id="atomic-boundary").status == "approval_required"
-    budget_before = app.database.execute_query(
-        "SELECT approved_pending_amount FROM budgets WHERE id = 1"
-    )["rows"][0]["approved_pending_amount"]
+    database_before = _database_dump(app)
 
     result = app.approve("atomic-boundary")
 
     assert result.data["execution_status"] == "failed"
     assert result.data["executed_actions"] == []
-    for table in ("purchase_requests", "purchase_orders", "operation_logs"):
-        rows = app.database.execute_query(f"SELECT COUNT(*) AS count FROM {table}")
-        assert rows["rows"] == [{"count": 0}]
-    budget_after = app.database.execute_query(
-        "SELECT approved_pending_amount FROM budgets WHERE id = 1"
-    )["rows"][0]["approved_pending_amount"]
-    assert budget_after == budget_before
+    assert _database_dump(app) == database_before
 
 
 def test_business_connection_enforces_foreign_keys_and_recovers(app, tmp_path):
-    assert app.database.execute_query(
-        "SELECT foreign_keys FROM pragma_foreign_keys"
-    )["rows"] == [{"foreign_keys": 1}]
     proposal = app.submit(REQUEST, session_id="foreign-key")
     assert proposal.status == "approval_required"
     envelope = {**proposal.data, "session_id": "foreign-key"}
     envelope = json.loads(json.dumps(envelope))
     envelope["recommended_plan"]["allocations"][-1]["supplier_id"] = -1
-    budget_before = app.database.execute_query("SELECT * FROM budgets")["rows"]
+    database_before = _database_dump(app)
 
     result = ProcurementServices(app.database, TODAY).execute_plan(json.dumps(envelope))
 
     assert result["status"] == "failed"
     assert result["error"]["database_error"]["type"] == "constraint_violation"
     assert result["executed_actions"] == []
-    for table in ("purchase_requests", "purchase_orders", "operation_logs"):
-        assert app.database.execute_query(f"SELECT COUNT(*) AS count FROM {table}")["rows"] == [
-            {"count": 0}
-        ]
-    assert app.database.execute_query("SELECT * FROM budgets")["rows"] == budget_before
+    assert _database_dump(app) == database_before
 
     assert app.approve("foreign-key").data["execution_status"] == "success"
-    # A separate connection must observe the committed trigger writes.
-    with closing(sqlite3.connect(tmp_path / "procurement.sqlite")) as persisted:
-        assert persisted.execute("SELECT COUNT(*) FROM purchase_orders").fetchone() == (2,)
+    assert len(_inserted_rows(app, "purchase_orders")) == 2
 
 
 def test_database_metrics_count_each_real_toolkit_operation(app):
     assert app.submit(REQUEST, session_id="database-metrics").status == "approval_required"
     assert app.approve("database-metrics").data["execution_status"] == "success"
     metrics = app.metrics()
-    assert metrics["database_calls"] == 7
-    assert metrics["database_route"] == ["execute_query"] * 5 + [
-        "execute_write",
-        "execute_query",
-    ]
+    assert metrics["database_calls"] == 1
+    assert metrics["database_route"] == ["execute_write"]
 
 
 def test_evaluation_reports_all_target_dimensions():

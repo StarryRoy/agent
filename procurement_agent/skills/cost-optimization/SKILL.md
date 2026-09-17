@@ -1,12 +1,49 @@
 ---
 name: cost-optimization
-description: 超预算、预算缺口和低成本方案重规划；all_suppliers_over_budget cost_reduction
-tags: [cost_reduction, all_suppliers_over_budget, 超预算]
+description: 超预算时协调定价、预算与风险重新规划
+version: "1.0.0"
+tags:
+  - cost_reduction
+  - all_suppliers_over_budget
+  - 超预算
+required_tools:
+  - pricing_agent
+  - budget_agent
+  - risk_agent
+dependencies: []
+scripts: []
 ---
-读取当前目标、procurement_context.budget_gap、effective_budget、current_plan 和已确认供应能力。
-Main 将 request、inventory_analysis、supplier_analysis 与 Context 委派 Pricing，设置
-analysis_strategy=cost_reduction；保留 replan_reason=all_suppliers_over_budget。
-Pricing 调用 analyze_pricing，比较有报价依据的谈判价格、供应商组合和分阶段方案。
-禁止为满足预算编造折扣、减少硬性数量或隐式放宽交期。谈判/分批条件必须明确标记。
-金额、数量、缺口和预算占用只采用 Tool 计算值。返回完整 plans、价格差异、条件和 evidence。
-Main 用新方案重新调用 Budget 与 Risk；仍不可行则请求用户调整，不得绕过 HITL。
+# 目标
+
+在不伪造折扣、不隐式减少硬性数量的前提下，寻找成本更低或明确条件性的备选方案。
+
+# 适用场景
+
+`replan_reason=all_suppliers_over_budget`、存在正 `budget_gap`，或用户明确要求压降成本。
+
+# 输入信息
+
+采购需求、库存缺口、候选供应商、当前方案、有效预算与预算缺口。
+
+# Workflow
+
+1. 委派 Pricing Agent，设置 `analysis_strategy=cost_reduction` 并保留重规划原因。
+2. 要求 Pricing 按其正常 Skill 动态查询并计算谈判目标、组合或分阶段条件方案。
+3. 将新方案依次交给 Budget 与 Risk 重新验证。
+4. 仍违反硬约束时阻断执行并请求用户调整。
+
+# 需要查询的数据
+
+本 Skill 不直接查询数据库；各专业 SubAgent 仅查询其正常 Skill 声明的相关表。
+
+# 查询结果字段契约
+
+Pricing 必须返回完整 `plans`（含 `quantity`、`total_cost`、`meets_quantity`、`meets_deadline`、`conditional`）；Budget 必须返回 `effective_available_budget` 和 `over_budget_amount`；Risk 必须返回 `recommended_plan` 或 `replan_reason`。
+
+# 判断与异常处理
+
+谈判价、分批或加急均必须标记为条件性。查询失败由对应 SubAgent 根据 Harness 错误修正；不得在 Main Agent 中生成 SQL。
+
+# 输出要求
+
+输出经预算和风险复核的新方案、条件、剩余缺口与不可行原因。

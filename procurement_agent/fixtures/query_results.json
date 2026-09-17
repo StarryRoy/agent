@@ -1,0 +1,56 @@
+{
+  "inventory": {
+    "1": [{"product_id": 1, "sku": "DEV-TAB-STD", "name": "标准工业平板设备", "current_qty": 180, "locked_qty": 30, "in_transit_qty": 40, "safety_stock": 60, "updated_at": "2026-09-10", "average_monthly_consumption": 75.0}],
+    "2": [{"product_id": 2, "sku": "LAP-BIZ-14", "name": "商务笔记本电脑", "current_qty": 85, "locked_qty": 20, "in_transit_qty": 0, "safety_stock": 25, "updated_at": "2026-09-10", "average_monthly_consumption": 20.0}],
+    "3": [{"product_id": 3, "sku": "MON-27-4K", "name": "27英寸4K显示器", "current_qty": 360, "locked_qty": 40, "in_transit_qty": 60, "safety_stock": 50, "updated_at": "2026-09-10", "average_monthly_consumption": 27.6666666667}]
+  },
+  "supplier": {
+    "1": [
+      {"supplier_id": 1, "code": "SUP-A", "name": "华东智造有限公司", "status": "active", "cooperation_status": "strategic", "risk_level": "low", "min_order_qty": 100, "max_capacity": 650, "standard_lead_days": 18, "unit_price": 1480.0, "available_qty": 650, "lead_time_days": 18, "quality_pass_rate": 0.9875, "on_time_rate": 0.9666666667, "severe_incidents": 0, "average_delay_days": 0.4},
+      {"supplier_id": 2, "code": "SUP-B", "name": "新锐科技股份有限公司", "status": "active", "cooperation_status": "approved", "risk_level": "medium", "min_order_qty": 50, "max_capacity": 300, "standard_lead_days": 22, "unit_price": 1420.0, "available_qty": 300, "lead_time_days": 22, "quality_pass_rate": 0.9538461538, "on_time_rate": 0.8846153846, "severe_incidents": 0, "average_delay_days": 1.8},
+      {"supplier_id": 3, "code": "SUP-C", "name": "远航设备贸易有限公司", "status": "active", "cooperation_status": "probation", "risk_level": "high", "min_order_qty": 100, "max_capacity": 550, "standard_lead_days": 35, "unit_price": 1320.0, "available_qty": 550, "lead_time_days": 35, "quality_pass_rate": 0.775, "on_time_rate": 0.6578947368, "severe_incidents": 3, "average_delay_days": 7.5},
+      {"supplier_id": 4, "code": "SUP-D", "name": "稳达工业系统有限公司", "status": "active", "cooperation_status": "approved", "risk_level": "low", "min_order_qty": 50, "max_capacity": 500, "standard_lead_days": 14, "unit_price": 1710.0, "available_qty": 500, "lead_time_days": 14, "quality_pass_rate": 1.0, "on_time_rate": 1.0, "severe_incidents": 0, "average_delay_days": 0.1},
+      {"supplier_id": 5, "code": "SUP-X", "name": "问题供应商有限公司", "status": "suspended", "cooperation_status": "blocked", "risk_level": "critical", "min_order_qty": 10, "max_capacity": 800, "standard_lead_days": 10, "unit_price": 1180.0, "available_qty": 800, "lead_time_days": 10, "quality_pass_rate": 0.6, "on_time_rate": 0.5, "severe_incidents": 4, "average_delay_days": 8.0}
+    ],
+    "2": [
+      {"supplier_id": 1, "code": "SUP-A", "name": "华东智造有限公司", "status": "active", "cooperation_status": "strategic", "risk_level": "low", "min_order_qty": 20, "max_capacity": 300, "standard_lead_days": 16, "unit_price": 6100.0, "available_qty": 300, "lead_time_days": 16, "quality_pass_rate": 0.9875, "on_time_rate": 0.9666666667, "severe_incidents": 0, "average_delay_days": 0.4},
+      {"supplier_id": 2, "code": "SUP-B", "name": "新锐科技股份有限公司", "status": "active", "cooperation_status": "approved", "risk_level": "medium", "min_order_qty": 20, "max_capacity": 250, "standard_lead_days": 20, "unit_price": 5750.0, "available_qty": 250, "lead_time_days": 20, "quality_pass_rate": 0.9538461538, "on_time_rate": 0.8846153846, "severe_incidents": 0, "average_delay_days": 1.8}
+    ],
+    "3": [
+      {"supplier_id": 4, "code": "SUP-D", "name": "稳达工业系统有限公司", "status": "active", "cooperation_status": "approved", "risk_level": "low", "min_order_qty": 30, "max_capacity": 600, "standard_lead_days": 12, "unit_price": 2350.0, "available_qty": 600, "lead_time_days": 12, "quality_pass_rate": 1.0, "on_time_rate": 1.0, "severe_incidents": 0, "average_delay_days": 0.1}
+    ]
+  },
+  "pricing": {
+    "1": [
+      {"supplier_id": 1, "code": "SUP-A", "name": "华东智造有限公司", "unit_price": 1480.0, "min_qty": 100, "available_qty": 650, "lead_time_days": 18, "quoted_at": "2026-09-01", "valid_until": "2026-12-31", "historical_average_price": 1455.0, "historical_min_price": 1450.0, "historical_max_price": 1460.0},
+      {"supplier_id": 2, "code": "SUP-B", "name": "新锐科技股份有限公司", "unit_price": 1420.0, "min_qty": 50, "available_qty": 300, "lead_time_days": 22, "quoted_at": "2026-09-02", "valid_until": "2026-11-30", "historical_average_price": 1395.0, "historical_min_price": 1390.0, "historical_max_price": 1400.0},
+      {"supplier_id": 3, "code": "SUP-C", "name": "远航设备贸易有限公司", "unit_price": 1320.0, "min_qty": 100, "available_qty": 550, "lead_time_days": 35, "quoted_at": "2026-09-01", "valid_until": "2026-10-31", "historical_average_price": 1265.0, "historical_min_price": 1250.0, "historical_max_price": 1280.0},
+      {"supplier_id": 4, "code": "SUP-D", "name": "稳达工业系统有限公司", "unit_price": 1710.0, "min_qty": 50, "available_qty": 500, "lead_time_days": 14, "quoted_at": "2026-09-03", "valid_until": "2026-12-31", "historical_average_price": 1680.0, "historical_min_price": 1680.0, "historical_max_price": 1680.0},
+      {"supplier_id": 5, "code": "SUP-X", "name": "问题供应商有限公司", "unit_price": 1180.0, "min_qty": 10, "available_qty": 800, "lead_time_days": 10, "quoted_at": "2026-09-03", "valid_until": "2026-12-31", "historical_average_price": null, "historical_min_price": null, "historical_max_price": null}
+    ],
+    "2": [
+      {"supplier_id": 1, "code": "SUP-A", "name": "华东智造有限公司", "unit_price": 6100.0, "min_qty": 20, "available_qty": 300, "lead_time_days": 16, "quoted_at": "2026-09-01", "valid_until": "2026-12-31", "historical_average_price": null, "historical_min_price": null, "historical_max_price": null},
+      {"supplier_id": 2, "code": "SUP-B", "name": "新锐科技股份有限公司", "unit_price": 5750.0, "min_qty": 20, "available_qty": 250, "lead_time_days": 20, "quoted_at": "2026-09-01", "valid_until": "2026-12-31", "historical_average_price": null, "historical_min_price": null, "historical_max_price": null}
+    ],
+    "3": [{"supplier_id": 4, "code": "SUP-D", "name": "稳达工业系统有限公司", "unit_price": 2350.0, "min_qty": 30, "available_qty": 600, "lead_time_days": 12, "quoted_at": "2026-09-01", "valid_until": "2026-12-31", "historical_average_price": null, "historical_min_price": null, "historical_max_price": null}]
+  },
+  "budget": {
+    "IT": [{"department_id": 1, "code": "IT", "name": "信息技术部", "fiscal_year": 2026, "total_amount": 2000000.0, "used_amount": 920000.0, "approved_pending_amount": 180000.0, "available_amount": 900000.0}],
+    "OPS": [{"department_id": 2, "code": "OPS", "name": "运营部", "fiscal_year": 2026, "total_amount": 1200000.0, "used_amount": 870000.0, "approved_pending_amount": 120000.0, "available_amount": 210000.0}],
+    "RND": [{"department_id": 3, "code": "RND", "name": "研发部", "fiscal_year": 2026, "total_amount": 3500000.0, "used_amount": 1800000.0, "approved_pending_amount": 350000.0, "available_amount": 1350000.0}]
+  },
+  "risk": {
+    "1": [
+      {"code": "SUP-A", "risk_level": "low", "inspected_lots": 80, "passed_lots": 79, "severe_incidents": 0, "quality_note": "稳定", "deliveries": 60, "on_time_deliveries": 58, "average_delay_days": 0.4, "delivery_note": "交付稳定"},
+      {"code": "SUP-B", "risk_level": "medium", "inspected_lots": 65, "passed_lots": 62, "severe_incidents": 0, "quality_note": "轻微外观问题", "deliveries": 52, "on_time_deliveries": 46, "average_delay_days": 1.8, "delivery_note": "旺季偶有延迟"},
+      {"code": "SUP-C", "risk_level": "high", "inspected_lots": 40, "passed_lots": 31, "severe_incidents": 3, "quality_note": "曾出现批次返工与拒收", "deliveries": 38, "on_time_deliveries": 25, "average_delay_days": 7.5, "delivery_note": "长延迟异常"},
+      {"code": "SUP-D", "risk_level": "low", "inspected_lots": 72, "passed_lots": 72, "severe_incidents": 0, "quality_note": "优秀", "deliveries": 48, "on_time_deliveries": 48, "average_delay_days": 0.1, "delivery_note": "准时率高"},
+      {"code": "SUP-X", "risk_level": "critical", "inspected_lots": 20, "passed_lots": 12, "severe_incidents": 4, "quality_note": "已暂停合作", "deliveries": 12, "on_time_deliveries": 6, "average_delay_days": 8.0, "delivery_note": "严重履约异常"}
+    ],
+    "2": [
+      {"code": "SUP-A", "risk_level": "low", "inspected_lots": 80, "passed_lots": 79, "severe_incidents": 0, "quality_note": "稳定", "deliveries": 60, "on_time_deliveries": 58, "average_delay_days": 0.4, "delivery_note": "交付稳定"},
+      {"code": "SUP-B", "risk_level": "medium", "inspected_lots": 65, "passed_lots": 62, "severe_incidents": 0, "quality_note": "轻微外观问题", "deliveries": 52, "on_time_deliveries": 46, "average_delay_days": 1.8, "delivery_note": "旺季偶有延迟"}
+    ],
+    "3": [{"code": "SUP-D", "risk_level": "low", "inspected_lots": 72, "passed_lots": 72, "severe_incidents": 0, "quality_note": "优秀", "deliveries": 48, "on_time_deliveries": 48, "average_delay_days": 0.1, "delivery_note": "准时率高"}]
+  }
+}

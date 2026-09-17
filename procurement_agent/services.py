@@ -14,6 +14,8 @@ from typing import Any
 from agent_harness import DatabaseToolkit
 from langchain_core.tools import BaseTool, StructuredTool
 
+from .database import read_sql_asset
+
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
@@ -27,8 +29,72 @@ def _payload(task: str) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {"text": str(task)}
 
 
-def _rows(result: dict[str, Any]) -> list[dict[str, Any]]:
-    return list(result.get("rows", [])) if result.get("ok") else []
+def _query_payload(value: dict[str, Any] | str) -> dict[str, Any]:
+    """Normalize a Harness Tool result passed back by the LLM to a calculator."""
+
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return {
+                "ok": False,
+                "error": {"type": "invalid_query_result", "message": "查询结果不是 JSON 对象"},
+            }
+    if isinstance(value, dict) and {"content", "status"}.issubset(value):
+        content = value.get("content")
+        return _query_payload(content if isinstance(content, (dict, str)) else {})
+    return value if isinstance(value, dict) else {
+        "ok": False,
+        "error": {"type": "invalid_query_result", "message": "查询结果必须是对象"},
+    }
+
+
+def _consume_query_result(
+    subtask: str,
+    query_result: dict[str, Any] | str,
+    required_fields: tuple[str, ...],
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any] | None]:
+    result = _query_payload(query_result)
+    evidence = {
+        "source": "DatabaseToolkit.execute_query",
+        "operation": result.get("operation", "execute_query"),
+        "row_count": int(result.get("row_count") or len(result.get("rows") or [])),
+        "truncated": bool(result.get("truncated", False)),
+        "subtask": subtask,
+    }
+    if not result.get("ok"):
+        return [], evidence, result.get("error") or {
+            "type": "query_failed",
+            "message": "查询失败",
+        }
+    if result.get("truncated"):
+        return [], evidence, {
+            "type": "result_truncated",
+            "message": "查询结果被截断；请缩小过滤范围后重试",
+        }
+    rows = list(result.get("rows") or [])
+    if not rows:
+        return [], evidence, {"type": "empty_result", "message": "查询未返回业务记录"}
+    if any(not isinstance(row, dict) for row in rows):
+        return [], evidence, {
+            "type": "result_contract_violation",
+            "message": "查询结果行必须是字段对象",
+        }
+    missing = sorted(
+        {
+            field
+            for row in rows
+            if isinstance(row, dict)
+            for field in required_fields
+            if field not in row
+        }
+    )
+    if missing:
+        return [], evidence, {
+            "type": "result_contract_violation",
+            "message": "查询结果缺少字段: " + ", ".join(missing),
+        }
+    return rows, evidence, None
 
 
 def _last_day_next_month(today: date) -> date:
@@ -48,23 +114,10 @@ def _days_until(raw: str | None, today: date) -> int | None:
 
 @dataclass(slots=True)
 class ProcurementServices:
-    """Domain operations; every database call goes through ``DatabaseToolkit``."""
+    """Deterministic calculators plus the separately approved execution write."""
 
     database: DatabaseToolkit
     today: date
-
-    def _query(
-        self, subtask: str, sql: str, parameters: dict[str, Any] | list[Any] | None = None
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        result = self.database.execute_query(sql, parameters)
-        context = {
-            "subtask": subtask,
-            "query": " ".join(sql.split()),
-            "data": result,
-            "facts": [],
-            "conclusion": "查询成功" if result.get("ok") else "查询失败",
-        }
-        return result, context
 
     def parse_requirement(self, task: str) -> dict[str, Any]:
         envelope = _payload(task)
@@ -213,61 +266,54 @@ class ProcurementServices:
             "missing_fields": missing,
         }
 
-    def analyze_inventory(self, task: str) -> dict[str, Any]:
+    def calculate_inventory(
+        self, task: str, query_result: dict[str, Any] | str
+    ) -> dict[str, Any]:
+        """Calculate inventory shortage from LLM-provided query rows only."""
+
         envelope = _payload(task)
         request = dict(envelope.get("request") or envelope)
         strategy = str(envelope.get("analysis_strategy") or "standard")
         if request.get("simulate_subagent_failure") and strategy != "fallback_recovery":
             raise RuntimeError("scripted inventory SubAgent failure")
-        schema_evidence: dict[str, Any] | None = None
-        if strategy == "schema_recovery":
-            schema_evidence = self.database.get_schema("inventory")
-            if not schema_evidence.get("ok"):
-                return {
-                    "subtask": "inventory_analysis",
-                    "queries": [],
-                    "facts": [],
-                    "conclusion": "库存 Schema 恢复失败",
-                    "status": "error",
-                    "analysis_strategy": strategy,
-                    "replan_reason": envelope.get("replan_reason"),
-                    "error": schema_evidence.get("error"),
-                }
-        if strategy == "fallback_recovery":
-            sql = """
-                SELECT p.id AS product_id, p.sku, p.name, i.current_qty, i.locked_qty,
-                       i.in_transit_qty, i.safety_stock, i.updated_at
-                FROM products p JOIN inventory i ON i.product_id = p.id
-                WHERE p.id = :product_id
-            """
-        else:
-            sql = """
-                SELECT p.id AS product_id, p.sku, p.name, i.current_qty, i.locked_qty,
-                       i.in_transit_qty, i.safety_stock, i.updated_at,
-                       COALESCE(AVG(h.consumed_qty), 0) AS average_monthly_consumption
-                FROM products p
-                JOIN inventory i ON i.product_id = p.id
-                LEFT JOIN inventory_history h ON h.product_id = p.id
-                WHERE p.id = :product_id
-                GROUP BY p.id, p.sku, p.name, i.current_qty, i.locked_qty,
-                         i.in_transit_qty, i.safety_stock, i.updated_at
-            """
-        if request.get("simulate_sql_failure") and strategy != "schema_recovery":
-            sql = "SELECT * FROM missing_inventory_table WHERE product_id = :product_id"
-        result, query = self._query(
-            "inventory_and_consumption", sql, {"product_id": request.get("product_id")}
+        required = (
+            "product_id",
+            "sku",
+            "name",
+            "current_qty",
+            "locked_qty",
+            "in_transit_qty",
+            "safety_stock",
+            "updated_at",
+            "average_monthly_consumption",
         )
-        records = _rows(result)
-        if not records:
+        records, evidence, error = _consume_query_result(
+            "inventory_and_consumption", query_result, required
+        )
+        if error:
             return {
                 "subtask": "inventory_analysis",
-                "queries": [query],
+                "evidence": [evidence],
                 "facts": [],
                 "conclusion": "库存数据不可用",
                 "status": "error",
                 "analysis_strategy": strategy,
                 "replan_reason": envelope.get("replan_reason"),
-                "error": result.get("error", {"type": "empty_result", "message": "无库存记录"}),
+                "error": error,
+            }
+        if len(records) != 1:
+            return {
+                "subtask": "inventory_analysis",
+                "evidence": [evidence],
+                "facts": [],
+                "conclusion": "库存查询必须且只能返回目标产品一行",
+                "status": "error",
+                "analysis_strategy": strategy,
+                "replan_reason": envelope.get("replan_reason"),
+                "error": {
+                    "type": "result_contract_violation",
+                    "message": f"库存查询返回 {len(records)} 行",
+                },
             }
         row = records[0]
         available = int(row["current_qty"]) - int(row["locked_qty"])
@@ -284,16 +330,16 @@ class ProcurementServices:
         demand = int(request.get("quantity") or 0)
         gap = max(demand - projected_usable, 0)
         risk = "high" if available < int(row["safety_stock"]) else "medium" if gap else "low"
-        query["facts"] = [
+        facts = [
             f"当前可用{available}",
             f"在途{row['in_transit_qty']}",
             f"安全库存{row['safety_stock']}",
             f"月均消耗约{forecast}",
         ]
-        query["conclusion"] = f"预计可用于本次需求{projected_usable}，采购缺口{gap}"
+        conclusion = f"预计可用于本次需求{projected_usable}，采购缺口{gap}"
         return {
             "subtask": "inventory_analysis",
-            "queries": [query],
+            "evidence": [evidence],
             "current_available_quantity": available,
             "in_transit_quantity": int(row["in_transit_qty"]),
             "safety_stock": int(row["safety_stock"]),
@@ -302,16 +348,19 @@ class ProcurementServices:
             "estimated_shortfall": gap,
             "recommended_purchase_quantity": gap,
             "inventory_risk": risk,
-            "facts": query["facts"],
-            "conclusion": query["conclusion"],
+            "facts": facts,
+            "conclusion": conclusion,
             "status": "success",
             "analysis_strategy": strategy,
             "replan_reason": envelope.get("replan_reason"),
-            "schema_evidence": schema_evidence,
             "fallback_basis": fallback_basis,
         }
 
-    def analyze_suppliers(self, task: str) -> dict[str, Any]:
+    def calculate_suppliers(
+        self, task: str, query_result: dict[str, Any] | str
+    ) -> dict[str, Any]:
+        """Screen supplier rows without generating or executing SQL."""
+
         envelope = _payload(task)
         request = dict(envelope.get("request") or {})
         inventory = dict(envelope.get("inventory_analysis") or {})
@@ -321,31 +370,45 @@ class ProcurementServices:
             and strategy != "fallback_recovery"
         ):
             raise RuntimeError("scripted supplier SubAgent failure")
-        sql = """
-            SELECT s.id AS supplier_id, s.code, s.name, s.status, s.cooperation_status,
-                   s.risk_level, sp.min_order_qty, sp.max_capacity, sp.standard_lead_days,
-                   q.unit_price, q.available_qty, q.lead_time_days,
-                   COALESCE(1.0 * qr.passed_lots / NULLIF(qr.inspected_lots, 0), 0) AS quality_pass_rate,
-                   COALESCE(1.0 * dr.on_time_deliveries / NULLIF(dr.deliveries, 0), 0) AS on_time_rate,
-                   COALESCE(qr.severe_incidents, 0) AS severe_incidents,
-                   COALESCE(dr.average_delay_days, 0) AS average_delay_days
-            FROM suppliers s
-            JOIN supplier_products sp ON sp.supplier_id = s.id
-            JOIN quotations q ON q.supplier_id = s.id AND q.product_id = sp.product_id
-            LEFT JOIN supplier_quality_records qr ON qr.supplier_id = s.id
-            LEFT JOIN supplier_delivery_records dr ON dr.supplier_id = s.id
-            WHERE sp.product_id = :product_id AND q.status = 'valid'
-            ORDER BY q.unit_price, s.id
-        """
-        result, query = self._query(
-            "supplier_capability_and_history", sql, {"product_id": request.get("product_id")}
+        records, evidence, error = _consume_query_result(
+            "supplier_capability_and_history",
+            query_result,
+            (
+                "supplier_id",
+                "code",
+                "name",
+                "status",
+                "cooperation_status",
+                "risk_level",
+                "min_order_qty",
+                "max_capacity",
+                "standard_lead_days",
+                "unit_price",
+                "available_qty",
+                "lead_time_days",
+                "quality_pass_rate",
+                "on_time_rate",
+                "severe_incidents",
+                "average_delay_days",
+            ),
         )
+        if error:
+            return {
+                "subtask": "supplier_analysis",
+                "evidence": [evidence],
+                "facts": [],
+                "conclusion": "供应商数据不可用",
+                "status": "error",
+                "analysis_strategy": strategy,
+                "replan_reason": envelope.get("replan_reason"),
+                "error": error,
+            }
         excluded = set(request.get("excluded_suppliers") or [])
         qty = int(inventory.get("recommended_purchase_quantity") or request.get("quantity") or 0)
         days = _days_until(request.get("latest_delivery_date"), self.today)
         candidates: list[dict[str, Any]] = []
         rejected: list[dict[str, Any]] = []
-        for row in _rows(result):
+        for row in records:
             reasons: list[str] = []
             if row["status"] != "active":
                 reasons.append("供应商当前非启用状态")
@@ -374,23 +437,27 @@ class ProcurementServices:
         elif strategy == "risk_first":
             order = {"low": 0, "medium": 1, "high": 2, "critical": 3}
             candidates.sort(key=lambda item: (order.get(item["risk_level"], 9), item["unit_price"]))
-        query["facts"] = [f"查询到{len(candidates)}家可用候选、{len(rejected)}家被排除"]
-        query["conclusion"] = "存在有效供应商" if candidates else "无有效供应商"
+        facts = [f"查询到{len(candidates)}家可用候选、{len(rejected)}家被排除"]
+        conclusion = "存在有效供应商" if candidates else "无有效供应商"
         return {
             "subtask": "supplier_analysis",
-            "queries": [query],
+            "evidence": [evidence],
             "candidate_suppliers": candidates,
             "rejected_suppliers": rejected,
             "required_quantity": qty,
             "delivery_window_days": days,
-            "facts": query["facts"],
-            "conclusion": query["conclusion"],
+            "facts": facts,
+            "conclusion": conclusion,
             "status": "success" if candidates else "error",
             "analysis_strategy": strategy,
             "replan_reason": envelope.get("replan_reason"),
         }
 
-    def analyze_pricing(self, task: str) -> dict[str, Any]:
+    def calculate_pricing(
+        self, task: str, query_result: dict[str, Any] | str
+    ) -> dict[str, Any]:
+        """Build price plans from contract-shaped query rows."""
+
         envelope = _payload(task)
         request = dict(envelope.get("request") or {})
         inventory = dict(envelope.get("inventory_analysis") or {})
@@ -398,28 +465,40 @@ class ProcurementServices:
         strategy = str(envelope.get("analysis_strategy") or "balanced")
         candidates = list(supplier_analysis.get("candidate_suppliers") or [])
         qty = int(inventory.get("recommended_purchase_quantity") or request.get("quantity") or 0)
-        sql = """
-            SELECT s.id AS supplier_id, s.code, s.name, q.unit_price, q.min_qty,
-                   q.available_qty, q.lead_time_days, q.quoted_at, q.valid_until,
-                   AVG(ph.unit_price) AS historical_average_price,
-                   MIN(ph.unit_price) AS historical_min_price,
-                   MAX(ph.unit_price) AS historical_max_price
-            FROM quotations q
-            JOIN suppliers s ON s.id = q.supplier_id
-            LEFT JOIN purchase_history ph ON ph.supplier_id = s.id AND ph.product_id = q.product_id
-            WHERE q.product_id = :product_id AND q.status = 'valid'
-            GROUP BY s.id, s.code, s.name, q.unit_price, q.min_qty, q.available_qty,
-                     q.lead_time_days, q.quoted_at, q.valid_until
-            ORDER BY q.unit_price
-        """
-        result, query = self._query(
-            "current_and_historical_prices", sql, {"product_id": request.get("product_id")}
+        records, evidence, error = _consume_query_result(
+            "current_and_historical_prices",
+            query_result,
+            (
+                "supplier_id",
+                "code",
+                "name",
+                "unit_price",
+                "min_qty",
+                "available_qty",
+                "lead_time_days",
+                "quoted_at",
+                "valid_until",
+                "historical_average_price",
+                "historical_min_price",
+                "historical_max_price",
+            ),
         )
+        if error:
+            return {
+                "subtask": "pricing_analysis",
+                "evidence": [evidence],
+                "facts": [],
+                "conclusion": "报价数据不可用",
+                "status": "error",
+                "analysis_strategy": strategy,
+                "replan_reason": envelope.get("replan_reason"),
+                "error": error,
+            }
         candidate_codes = {item.get("code") for item in candidates}
         external = supplier_analysis.get("external_status") or {}
         quotes: list[dict[str, Any]] = []
         anomalies: list[dict[str, Any]] = []
-        for row in _rows(result):
+        for row in records:
             if row["code"] not in candidate_codes:
                 continue
             historical = row.get("historical_average_price")
@@ -610,11 +689,11 @@ class ProcurementServices:
         )
         for index, plan in enumerate(plans, start=1):
             plan["plan_id"] = f"PLAN-{index}"
-        query["facts"] = [f"比较{len(quotes)}份有效报价和{len(plans)}个可行组合"]
-        query["conclusion"] = "已生成价格方案" if plans else "无法形成满足数量和交期的组合"
+        facts = [f"比较{len(quotes)}份有效报价和{len(plans)}个可行组合"]
+        conclusion = "已生成价格方案" if plans else "无法形成满足数量和交期的组合"
         return {
             "subtask": "pricing_analysis",
-            "queries": [query],
+            "evidence": [evidence],
             "quotations": quotes,
             "historical_reference": [
                 {
@@ -631,37 +710,60 @@ class ProcurementServices:
             "anomalies": anomalies,
             "plans": plans,
             "recommended_price_plan": plans[0] if plans else None,
-            "facts": query["facts"],
-            "conclusion": query["conclusion"],
+            "facts": facts,
+            "conclusion": conclusion,
             "status": "success" if plans else "error",
             "analysis_strategy": strategy,
             "replan_reason": envelope.get("replan_reason"),
         }
 
-    def analyze_budget(self, task: str) -> dict[str, Any]:
+    def calculate_budget(
+        self, task: str, query_result: dict[str, Any] | str
+    ) -> dict[str, Any]:
+        """Calculate budget availability from LLM-provided rows."""
+
         envelope = _payload(task)
         strategy = str(envelope.get("analysis_strategy") or "standard")
         request = dict(envelope.get("request") or {})
         pricing = dict(envelope.get("pricing_analysis") or {})
-        sql = """
-            SELECT d.id AS department_id, d.code, d.name, b.fiscal_year,
-                   b.total_amount, b.used_amount, b.approved_pending_amount,
-                   b.total_amount - b.used_amount - b.approved_pending_amount AS available_amount
-            FROM departments d JOIN budgets b ON b.department_id = d.id
-            WHERE d.code = :code AND b.fiscal_year = :year
-        """
-        result, query = self._query(
+        records, evidence, error = _consume_query_result(
             "department_budget",
-            sql,
-            {"code": request.get("department_code", "IT"), "year": self.today.year},
+            query_result,
+            (
+                "department_id",
+                "code",
+                "name",
+                "fiscal_year",
+                "total_amount",
+                "used_amount",
+                "approved_pending_amount",
+                "available_amount",
+            ),
         )
-        records = _rows(result)
-        if not records:
+        if error:
             return {
                 "subtask": "budget_analysis",
-                "queries": [query],
+                "evidence": [evidence],
+                "facts": [],
                 "status": "error",
                 "conclusion": "预算数据不可用",
+                "analysis_strategy": strategy,
+                "replan_reason": envelope.get("replan_reason"),
+                "error": error,
+            }
+        if len(records) != 1:
+            return {
+                "subtask": "budget_analysis",
+                "evidence": [evidence],
+                "facts": [],
+                "status": "error",
+                "conclusion": "预算查询必须且只能返回部门财年一行",
+                "analysis_strategy": strategy,
+                "replan_reason": envelope.get("replan_reason"),
+                "error": {
+                    "type": "result_contract_violation",
+                    "message": f"预算查询返回 {len(records)} 行",
+                },
             }
         row = records[0]
         plans = list(pricing.get("plans") or [])
@@ -670,17 +772,17 @@ class ProcurementServices:
         user_budget = request.get("budget")
         effective = min(available, float(user_budget)) if user_budget is not None else available
         over = max(estimated - effective, 0)
-        query["facts"] = [
+        facts = [
             f"部门可用预算{available:.2f}",
             f"用户预算上限{float(user_budget):.2f}"
             if user_budget is not None
             else "用户未设置单独上限",
             f"最低可行方案预计占用{estimated:.2f}",
         ]
-        query["conclusion"] = "预算满足" if over == 0 else f"超出有效预算{over:.2f}"
+        conclusion = "预算满足" if over == 0 else f"超出有效预算{over:.2f}"
         return {
             "subtask": "budget_analysis",
-            "queries": [query],
+            "evidence": [evidence],
             "department": {"id": row["department_id"], "code": row["code"], "name": row["name"]},
             "budget_total": float(row["total_amount"]),
             "used_budget": float(row["used_amount"]),
@@ -693,14 +795,18 @@ class ProcurementServices:
             "over_budget_amount": over,
             "adjustment_room": max(effective - estimated, 0),
             "budget_risk": "high" if over else "medium" if estimated > effective * 0.9 else "low",
-            "facts": query["facts"],
-            "conclusion": query["conclusion"],
+            "facts": facts,
+            "conclusion": conclusion,
             "status": "success",
             "analysis_strategy": strategy,
             "replan_reason": envelope.get("replan_reason"),
         }
 
-    def analyze_risk(self, task: str) -> dict[str, Any]:
+    def calculate_risk(
+        self, task: str, query_result: dict[str, Any] | str
+    ) -> dict[str, Any]:
+        """Score plans from query rows and upstream deterministic results."""
+
         envelope = _payload(task)
         strategy = str(envelope.get("analysis_strategy") or "standard")
         request = dict(envelope.get("request") or {})
@@ -708,19 +814,33 @@ class ProcurementServices:
         pricing = dict(envelope.get("pricing_analysis") or {})
         budget = dict(envelope.get("budget_analysis") or {})
         candidates = {item["code"]: item for item in supplier.get("candidate_suppliers") or []}
-        sql = """
-            SELECT s.code, s.risk_level, q.inspected_lots, q.passed_lots,
-                   q.severe_incidents, q.note AS quality_note, d.deliveries,
-                   d.on_time_deliveries, d.average_delay_days, d.note AS delivery_note
-            FROM suppliers s
-            LEFT JOIN supplier_quality_records q ON q.supplier_id = s.id
-            LEFT JOIN supplier_delivery_records d ON d.supplier_id = s.id
-            WHERE s.id IN (SELECT supplier_id FROM supplier_products WHERE product_id = :product_id)
-        """
-        result, query = self._query(
-            "supplier_risk_records", sql, {"product_id": request.get("product_id")}
+        rows, evidence, error = _consume_query_result(
+            "supplier_risk_records",
+            query_result,
+            (
+                "code",
+                "risk_level",
+                "inspected_lots",
+                "passed_lots",
+                "severe_incidents",
+                "quality_note",
+                "deliveries",
+                "on_time_deliveries",
+                "average_delay_days",
+                "delivery_note",
+            ),
         )
-        records = {row["code"]: row for row in _rows(result)}
+        if error:
+            return {
+                "subtask": "risk_analysis",
+                "evidence": [evidence],
+                "facts": [],
+                "conclusion": "风险数据不可用",
+                "status": "error",
+                "analysis_strategy": strategy,
+                "error": error,
+            }
+        records = {row["code"]: row for row in rows}
         effective_budget = float(budget.get("effective_available_budget") or 0)
         assessed: list[dict[str, Any]] = []
         for plan in pricing.get("plans") or []:
@@ -800,11 +920,11 @@ class ProcurementServices:
             main_risks = sorted({risk for item in assessed for risk in item["risk_items"]})
         else:
             main_risks = list(recommended["risk_items"])
-        query["facts"] = [f"评估{len(assessed)}个方案，{len(feasible)}个通过硬约束"]
-        query["conclusion"] = "形成推荐方案" if recommended else "需要重新规划或用户调整约束"
+        facts = [f"评估{len(assessed)}个方案，{len(feasible)}个通过硬约束"]
+        conclusion = "形成推荐方案" if recommended else "需要重新规划或用户调整约束"
         return {
             "subtask": "risk_analysis",
-            "queries": [query],
+            "evidence": [evidence],
             "risk_level": recommended.get("risk_level") if recommended else "high",
             "main_risks": main_risks,
             "risk_basis": records,
@@ -814,8 +934,8 @@ class ProcurementServices:
             "replan_reason": None
             if recommended
             else self._replan_reason(assessed, effective_budget),
-            "facts": query["facts"],
-            "conclusion": query["conclusion"],
+            "facts": facts,
+            "conclusion": conclusion,
             "status": "success" if recommended else "needs_replan",
             "analysis_strategy": strategy,
         }
@@ -873,17 +993,7 @@ class ProcurementServices:
         # trigger steps in the same statement and rolls everything back on any RAISE,
         # foreign-key, budget, status, or log failure.
         request_write = self.database.execute_write(
-            """
-            INSERT INTO purchase_requests(
-                request_no, session_id, department_id, product_id, requested_qty, approved_qty,
-                required_date, supplier_plan_json, unit_price, total_amount, status,
-                approval_status, created_at
-            ) VALUES(
-                :request_no, :session_id, :department_id, :product_id, :requested_qty, :approved_qty,
-                :required_date, :plan_json, :unit_price, :total_amount, 'approved',
-                'approved', :created_at
-            )
-            """,
+            read_sql_asset("purchase_requests", "execute.sql"),
             {
                 "request_no": request_no,
                 "session_id": session_id,
@@ -912,31 +1022,6 @@ class ProcurementServices:
                 "transaction": {"committed": False, "rolled_back": True},
             }
         request_id = request_write["last_insert_id"]
-        verification = self.database.execute_query(
-            """
-            SELECT pr.status, pr.approval_status, pr.session_id,
-                   COUNT(DISTINCT po.id) AS order_count,
-                   COUNT(DISTINCT ol.id) AS log_count
-            FROM purchase_requests pr
-            LEFT JOIN purchase_orders po ON po.request_id = pr.id
-            LEFT JOIN operation_logs ol ON ol.entity_type = 'purchase_request'
-                AND ol.entity_id = pr.id AND ol.action = 'approve_and_execute'
-            WHERE pr.id = :request_id
-            GROUP BY pr.id, pr.status, pr.approval_status, pr.session_id
-            """,
-            {"request_id": request_id},
-        )
-        verification_rows = _rows(verification)
-        verified = bool(
-            verification_rows
-            and verification_rows[0]["status"] == "ordered"
-            and verification_rows[0]["approval_status"] == "approved"
-            and verification_rows[0]["session_id"] == session_id
-            and int(verification_rows[0]["order_count"]) == len(plan["allocations"])
-            and int(verification_rows[0]["log_count"]) == 1
-        )
-        if not verified:
-            raise RuntimeError("Committed procurement transaction failed invariant verification")
         actions = [
             {"action": "create_purchase_request", "id": request_id, "request_no": request_no},
             {"action": "create_purchase_orders", "count": len(plan["allocations"])},
@@ -952,7 +1037,11 @@ class ProcurementServices:
             "purchase_order_count": len(plan["allocations"]),
             "budget_reserved": total_cost,
             "executed_actions": actions,
-            "transaction": {"committed": True, "rolled_back": False, "verified": True},
+            "transaction": {
+                "committed": True,
+                "rolled_back": False,
+                "verified_by": "database_constraints_and_triggers",
+            },
         }
 
     def tools(self) -> dict[str, BaseTool]:
@@ -963,25 +1052,25 @@ class ProcurementServices:
                 self.parse_requirement,
                 "Parse and merge a procurement requirement.",
             ),
-            "analyze_inventory": (
-                self.analyze_inventory,
-                "Analyze inventory, forecast use, and purchase gap.",
+            "calculate_inventory": (
+                self.calculate_inventory,
+                "Calculate inventory shortage from a successful execute_query result.",
             ),
-            "analyze_suppliers": (
-                self.analyze_suppliers,
-                "Screen suppliers using database evidence.",
+            "calculate_suppliers": (
+                self.calculate_suppliers,
+                "Screen suppliers from a successful execute_query result.",
             ),
-            "analyze_pricing": (
-                self.analyze_pricing,
-                "Compare quotations and build cost combinations.",
+            "calculate_pricing": (
+                self.calculate_pricing,
+                "Build price combinations from a successful execute_query result.",
             ),
-            "analyze_budget": (
-                self.analyze_budget,
-                "Validate the proposal against department and user budgets.",
+            "calculate_budget": (
+                self.calculate_budget,
+                "Calculate budget fit from a successful execute_query result.",
             ),
-            "analyze_risk": (
-                self.analyze_risk,
-                "Assess supplier, delivery, quality, price, and concentration risk.",
+            "calculate_risk": (
+                self.calculate_risk,
+                "Score plans from a successful execute_query result.",
             ),
             "execute_procurement_plan": (
                 self.execute_plan,
@@ -991,10 +1080,12 @@ class ProcurementServices:
         result: dict[str, BaseTool] = {}
         for name, (function, description) in definitions.items():
             metadata = {
-                "database_toolkit": name != "parse_requirement",
-                "database_operation": "write" if name == "execute_procurement_plan" else "read",
+                "database_toolkit": name == "execute_procurement_plan",
                 "business_domain": "procurement",
+                "deterministic_calculator": name.startswith("calculate_"),
             }
+            if name == "execute_procurement_plan":
+                metadata["database_operation"] = "write"
             result[name] = StructuredTool.from_function(
                 function,
                 name=name,

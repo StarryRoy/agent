@@ -38,7 +38,10 @@ class ProcurementSkillMiddleware(AgentMiddleware):
             goal = envelope.get("request", task)
             gap = envelope.get("procurement_context", {}).get("budget_gap")
         query = None
-        if "delivery" in reason:
+        if self.role != "main" and self.skills:
+            # Query SubAgents each receive exactly one normal domain Skill.
+            query = self.skills[0].name
+        elif "delivery" in reason:
             query = "delivery-recovery"
         elif "risk" in reason:
             query = "supplier-risk-review"

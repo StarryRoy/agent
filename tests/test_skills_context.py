@@ -12,37 +12,66 @@ from procurement_agent import create_procurement_app
 from procurement_agent.context import ProcurementContextMiddleware, task_view
 
 
-@pytest.mark.parametrize(
-    "text,skill,role",
-    [
-        ("下个月需要500台设备，预算10万。", "cost-optimization", "pricing_agent"),
-        ("需要采购500台设备，预算80万，2026-09-15必须到货。", "delivery-recovery", "pricing_agent"),
-        ("下个月紧急需要500台设备，预算80万。", "urgent-procurement", "supplier_agent"),
-        ("下个月需要500台设备，预算80万。", "supplier-risk-review", "supplier_agent"),
-    ],
-)
-def test_scenario_loads_native_skill(tmp_path, text, skill, role):
+def test_each_query_subagent_loads_only_its_domain_skill(tmp_path):
     app = create_procurement_app(
         data_dir=tmp_path, deterministic=True, enable_mcp=False, today=date(2026, 9, 10)
     )
     try:
-        if skill == "supplier-risk-review":
-            assert app.database.execute_write("UPDATE suppliers SET risk_level = 'critical'")["ok"]
-            assert app.database.execute_write(
-                "UPDATE supplier_quality_records SET passed_lots = 0, severe_incidents = 10"
-            )["ok"]
-        result = app.submit(text, session_id="skill-scenario")
-        assert result.status in {"completed", "approval_required"}
+        result = app.submit("下个月需要500台设备，预算80万。", session_id="skill-scenario")
+        assert result.status == "approval_required"
+        events = [
+            json.loads(line)
+            for line in (tmp_path / "traces.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        loads = [event for event in events if event["event_type"] == "skill.load"]
+        expected = {
+            "inventory_agent": "inventory-analysis@1.0.0",
+            "supplier_agent": "supplier-analysis@1.0.0",
+            "pricing_agent": "pricing-analysis@1.0.0",
+            "budget_agent": "budget-analysis@1.0.0",
+            "risk_agent": "risk-analysis@1.0.0",
+        }
+        for role, skill in expected.items():
+            role_loads = [event for event in loads if event["agent_name"] == role]
+            assert len(role_loads) == 1
+            assert role_loads[0]["metadata"]["skills"] == [skill]
+    finally:
+        app.close()
+
+
+@pytest.mark.parametrize(
+    "text,skill",
+    [
+        ("下个月需要500台设备，预算10万。", "cost-optimization@1.0.0"),
+        ("需要采购500台设备，预算80万，2026-09-15必须到货。", "delivery-recovery@1.0.0"),
+        ("下个月紧急需要500台设备，预算80万。", "urgent-procurement@1.0.0"),
+        (
+            "下个月需要500台设备，预算80万，不要供应商A并排除供应商D。",
+            "supplier-risk-review@1.0.0",
+        ),
+    ],
+)
+def test_replanning_skills_are_loaded_only_by_main_agent(tmp_path, text, skill):
+    app = create_procurement_app(
+        data_dir=tmp_path, deterministic=True, enable_mcp=False, today=date(2026, 9, 10)
+    )
+    try:
+        app.submit(text, session_id="main-skill")
         events = [
             json.loads(line)
             for line in (tmp_path / "traces.jsonl").read_text(encoding="utf-8").splitlines()
         ]
         loads = [event for event in events if event["event_type"] == "skill.load"]
         assert any(
-            event["agent_name"] == role and skill in event["metadata"]["skills"] for event in loads
+            event["agent_name"] == "procurement_main_agent"
+            and skill in event["metadata"]["skills"]
+            for event in loads
         )
-        if skill == "urgent-procurement":
-            assert not any("cost-optimization" in event["metadata"]["skills"] for event in loads)
+        assert not any(
+            event["agent_name"] != "procurement_main_agent"
+            and skill in event["metadata"]["skills"]
+            for event in loads
+        )
     finally:
         app.close()
 
@@ -56,7 +85,7 @@ def test_context_preserves_gap_plan_and_raw_checkpoint_message():
         "queries": [
             {
                 "subtask": "department_budget",
-                "query": "SELECT secret_raw_rows",
+                "query": "secret_raw_rows",
                 "data": {"ok": True, "rows": [{"large": "x" * 10000}]},
                 "facts": ["部门可用预算1000"],
             }

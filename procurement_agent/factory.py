@@ -26,11 +26,12 @@ from .context import ProcurementContextMiddleware
 from .database import ProcurementSQLiteBackend, initialize_database
 from .metrics import JsonLinesEventSink, ObservedDatabaseToolkit, ProcurementMetricSink
 from .middleware import ProcurementOrchestrationMiddleware
-from .models import DeterministicProcurementModel
+from .models import DeterministicProcurementModel, build_mock_execute_query_tool
 from .persistence import PersistentSQLiteSaver
 from .schemas import ProcurementAnalysis, ProcurementDecision, ProcurementState
 from .services import ProcurementServices
 from .skill_policy import ProcurementSkillMiddleware
+from .sql_catalog import role_database_context
 
 _MCP_TOOL_CACHE: list[Any] | None = None
 
@@ -51,34 +52,37 @@ async def _supplier_mcp_tools() -> list[Any]:
     return list(_MCP_TOOL_CACHE)
 
 
-def _instructions(role: str) -> str:
+def _instructions(role: str, business_today: date) -> str:
     common = (
         "你是企业采购应用的专业 SubAgent。只处理分配给你的领域，使用工具获取事实，"
         "返回稳定 JSON，不编造数据库结果。保留 Tool 的业务字段、关键数值、约束、facts、"
-        "conclusion、status、evidence 和 source_ref；不返回 SQL、queries 或原始 MCP 包装。"
-        "基于 procurement_context 和当前任务使用已加载 Skill，必要时调用 load_skill；"
-        "Skill 只指导策略，计算和校验必须交给现有 Tool，禁止自行改写计算结果。"
+        "conclusion、status、evidence 和 source_ref；最终结果不返回 SQL 或原始 MCP 包装。"
+        "若本角色提供 Skill，必须先加载并遵循。查询角色先根据 Skill、Schema 和 Metadata 动态生成 SQL，"
+        "直接调用 Harness execute_query；返回 ok=false 时把 Harness error 作为反馈，修正 SQL 后"
+        "重试，成功且字段契约完整后才调用确定性计算 Tool。不得让计算 Tool 生成或执行 SQL。"
+        f"当前业务日期为 {business_today.isoformat()}。"
     )
     details = {
         "requirement": "提取产品、数量、预算、交期、质量、优先级和供应商约束；缺失字段必须明确。",
         "inventory": (
-            "计算可用、锁定、在途、安全库存、预测消耗、采购缺口和建议数量。"
+            "查询后调用 calculate_inventory 计算可用、在途、安全库存、预测消耗和采购缺口。"
             "task.analysis_strategy 支持 standard、schema_recovery、fallback_recovery。"
         ),
         "supplier": (
-            "筛选供应能力、MOQ、交付周期、合作状态和历史表现，并核验外部实时状态。"
+            "查询后调用 calculate_suppliers 筛选能力、MOQ、交期、合作状态和历史表现，并核验外部实时状态。"
             "重规划时按 task.analysis_strategy 使用 delivery_first、risk_first 或 fallback_recovery。"
         ),
         "pricing": (
-            "比较当前与历史价格，计算单一及组合供应方案并识别报价异常。"
+            "查询后调用 calculate_pricing 比较当前与历史价格，计算单一及组合方案。"
             "重规划时按 task.analysis_strategy 使用 cost_reduction、delivery_recovery 或"
             "risk_diversification，明确条件性方案。"
         ),
-        "budget": "核验部门总额、已用、已审批未执行、可用预算和本次预计占用。",
-        "risk": "评估履约、交付、质量、报价、集中度、历史异常和规模风险。",
+        "budget": "查询后调用 calculate_budget 核验部门余额、用户上限和方案预计占用。",
+        "risk": "查询后调用 calculate_risk 评估履约、交付、质量、预算、集中度和规模风险。",
         "execution": "只执行 Main Agent 已确认的采购方案，不重新决策。所有写操作使用专用工具。",
     }
-    return f"{common}{details[role]}"
+    database_context = role_database_context(role)
+    return f"{common}{details[role]}" + (f"\n\n{database_context}" if database_context else "")
 
 
 async def create_procurement_app_async(
@@ -119,17 +123,21 @@ async def create_procurement_app_async(
         require_write_approval=False,
         event_sinks=sinks,
     )
-    services = ProcurementServices(database, today or datetime.now(UTC).date())
+    business_today = today or datetime.now(UTC).date()
+    services = ProcurementServices(database, business_today)
     tools = services.tools()
+    database_tools = {tool.name: tool for tool in database.get_tools(include_write=False)}
+    execute_query_tool = database_tools["execute_query"]
     mcp_tools = await _supplier_mcp_tools() if enable_mcp else []
 
     sub_config = RuntimeConfig(
-        max_iterations=5,
+        max_iterations=8,
         retry_attempts=2,
         timeout_seconds=30,
         call_limit=16,
         context_policy=ContextPolicy(
             summary_token_threshold=24_000,
+            model_max_input_tokens=128_000,
             summary_keep_recent=16,
             max_skill_candidates=2,
             skill_retention_turns=0,
@@ -143,6 +151,7 @@ async def create_procurement_app_async(
         call_limit=48,
         context_policy=ContextPolicy(
             summary_token_threshold=64_000,
+            model_max_input_tokens=128_000,
             summary_keep_recent=32,
             max_tool_results=24,
             max_tool_result_chars=50_000,
@@ -155,11 +164,11 @@ async def create_procurement_app_async(
     subagents = []
     role_tool_names = {
         "requirement": "parse_requirement",
-        "inventory": "analyze_inventory",
-        "supplier": "analyze_suppliers",
-        "pricing": "analyze_pricing",
-        "budget": "analyze_budget",
-        "risk": "analyze_risk",
+        "inventory": "calculate_inventory",
+        "supplier": "calculate_suppliers",
+        "pricing": "calculate_pricing",
+        "budget": "calculate_budget",
+        "risk": "calculate_risk",
         "execution": "execute_procurement_plan",
     }
     configured_roles = dict(role_models or {})
@@ -167,14 +176,21 @@ async def create_procurement_app_async(
     skills = [SkillLoader().load(path) for path in sorted(skill_root.iterdir()) if path.is_dir()]
     selector = LexicalSkillSelector()
     role_skills = {
-        "requirement": {"urgent-procurement"},
-        "inventory": {"urgent-procurement", "delivery-recovery"},
-        "supplier": {"urgent-procurement", "supplier-risk-review", "delivery-recovery"},
-        "pricing": {skill.name for skill in skills},
-        "budget": {"cost-optimization"},
-        "risk": {"supplier-risk-review", "delivery-recovery", "cost-optimization"},
+        "requirement": set(),
+        "inventory": {"inventory-analysis"},
+        "supplier": {"supplier-analysis"},
+        "pricing": {"pricing-analysis"},
+        "budget": {"budget-analysis"},
+        "risk": {"risk-analysis"},
         "execution": set(),
     }
+    main_skill_names = {
+        "cost-optimization",
+        "delivery-recovery",
+        "supplier-risk-review",
+        "urgent-procurement",
+    }
+    main_skills = [skill for skill in skills if skill.name in main_skill_names]
 
     def model_for(role: str) -> BaseChatModel | str | None:
         if deterministic:
@@ -184,13 +200,20 @@ async def create_procurement_app_async(
     for role in ("requirement", "inventory", "supplier", "pricing", "budget", "risk", "execution"):
         selected_skills = [skill for skill in skills if skill.name in role_skills[role]]
         role_tools = [tools[role_tool_names[role]]]
+        if role in {"inventory", "supplier", "pricing", "budget", "risk"}:
+            # Production receives the native Harness Tool object. Deterministic
+            # tests substitute an explicit Mock Tool with the same contract.
+            role_tools.insert(
+                0,
+                build_mock_execute_query_tool(role) if deterministic else execute_query_tool,
+            )
         if role == "supplier":
             role_tools.extend(mcp_tools)
         subagents.append(
             create_agent(
                 name=f"{role}_agent",
                 description=f"企业采购{role}专业分析与处理",
-                instructions=_instructions(role),
+                instructions=_instructions(role, business_today),
                 model=model_for(role),
                 skills=selected_skills,
                 skill_selector=selector,
@@ -232,7 +255,7 @@ async def create_procurement_app_async(
             "结构化格式和可读 summary。"
         ),
         model=model_for("main"),
-        skills=skills,
+        skills=main_skills,
         skill_selector=selector,
         subagents=subagents,
         response_format=ProcurementDecision.model_json_schema(),
@@ -240,7 +263,7 @@ async def create_procurement_app_async(
         runtime_config=main_config,
         middleware=[
             ProcurementContextMiddleware(),
-            ProcurementSkillMiddleware("main", skills, selector),
+            ProcurementSkillMiddleware("main", main_skills, selector),
             ProcurementOrchestrationMiddleware(),
         ],
         checkpointer=checkpointer,

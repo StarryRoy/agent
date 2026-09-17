@@ -1,0 +1,5 @@
+CREATE TABLE IF NOT EXISTS departments (
+    id INTEGER PRIMARY KEY,
+    code TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL
+);

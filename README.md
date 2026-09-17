@@ -7,9 +7,11 @@ Harness 原生 HITL 在持久化 Checkpoint 上暂停和恢复。
 正式应用由真实、可配置的 LangChain `BaseChatModel` 驱动 Harness Agent/Tool 循环。Main
 Agent 根据会话证据动态选择和协调 SubAgent；项目不会在未配置模型时隐式退回 Python 规则。
 确定性 `DeterministicProcurementModel` 仅通过 `deterministic=True` 或 CLI 的
-`--deterministic` 显式启用，专用于离线回归和异常注入。业务数据访问统一经过 Harness 的
-`DatabaseToolkit`，外部供应商状态通过 Harness `load_mcp_tools()` 加载的本地标准 MCP Server
-获取。项目没有修改 `agent_harness`。
+`--deterministic` 显式启用，专用于离线回归和异常注入；该模式的查询由同名 Mock Tool 返回
+契约化 rows，不保存测试查询 SQL。正式模式的查询全部由 LLM 根据当前 Skill、Schema 和
+Metadata 动态生成，并直接调用 Harness `DatabaseToolkit.get_tools()` 提供的 `execute_query`。
+外部供应商状态通过 Harness `load_mcp_tools()` 加载的本地标准 MCP Server 获取。项目没有修改
+`agent_harness`。
 
 ## 架构
 
@@ -49,22 +51,28 @@ cd D:\Project\agent
 
 ### 场景 Skill 与业务 Context
 
-`procurement_agent/skills/` 包含 `cost-optimization`、`urgent-procurement`、
-`supplier-risk-review`、`delivery-recovery` 四个采购策略。应用复用 Harness 的
-`SkillLoader`、`LexicalSkillSelector`（`SkillSelector` 实现）和原生 `load_skill`：
-只展示少量候选说明，按当前任务和 Replan 原因加载策略正文，并按 Agent 职责限制候选。
-Session 下一轮会释放未继续使用的 Skill；加载事件记录在现有 Trace 的 `skill.load` 中。
-Skill 负责分析方法，金额、数量、交期、预算与风险计算继续使用现有 Tool。
+`procurement_agent/skills/` 为 Inventory、Supplier、Pricing、Budget、Risk 各提供一个正常业务
+Skill，并保留 `cost-optimization`、`urgent-procurement`、`supplier-risk-review`、
+`delivery-recovery` 四个重规划策略。每个目录都使用 Harness `SkillLoader` 的原生 `SKILL.md`
+格式和受支持 frontmatter。查询 SubAgent 只注册自己的领域 Skill；Main Agent 只注册重规划
+Skill。加载事件记录在现有 Trace 的 `skill.load` 中。
 
-模型输入中的 SQL 查询包会转换成业务字段和 `evidence`，保留精确数值、约束、方案、
-状态及 `source_ref`。原始 Tool 消息仍由 Harness Checkpoint 保存；需要更多事实时重新
-委派对应分析 Tool 查询。同轮被新分析替代的旧结果不再重复进入模型输入，委派只传所需依赖。
+每个查询 Skill 定义业务 Workflow、所需数据和稳定字段契约，不包含具体 SQL。对应 SubAgent
+只得到相关表的 `schema.sql`/`metadata.md`，调用原生 `execute_query` 后再把成功结果交给
+`calculate_inventory`、`calculate_suppliers`、`calculate_pricing`、`calculate_budget` 或
+`calculate_risk`。Harness 返回查询错误时，LLM 根据错误、Schema、Metadata 和 Skill 修正 SQL
+重试；Python 计算器不生成也不执行查询。
+
+模型输入中的查询结果会转换成业务字段和 `evidence`，保留精确数值、约束、方案、状态及
+`source_ref`，最终业务结果不回传 SQL。原始 Tool 消息仍由 Harness Checkpoint 保存；需要更多
+事实时重新委派对应分析 Tool 查询。同轮被新分析替代的旧结果不再重复进入模型输入，委派只传
+所需依赖。
 结构化 `procurement_context` 随子任务进入既有 Session，包含目标、事实、结论、当前方案、
 `budget_gap`、有效预算、风险、Replan 原因与来源；新分析使下游旧结论失效，等待重新核验。
 
-例如预算不足时，保留预算缺口和当前方案，Pricing 加载 `cost-optimization`，以
-`cost_reduction` 调用现有定价 Tool，再由 Budget/Risk 校验新方案。交期和供应商风险采用
-对应策略，继续沿用原有 Replan、MCP 和 HITL 审批。
+例如预算不足时，Main 加载 `cost-optimization` 并保留预算缺口和当前方案，再委派 Pricing 以
+`cost_reduction` 执行其领域 Skill，最后由 Budget/Risk 校验新方案。交期和供应商风险采用对应
+策略，继续沿用原有 Replan、MCP 和 HITL 审批。
 
 ### 一键启动
 
@@ -253,7 +261,9 @@ with create_procurement_app(data_dir="data", model=model) as app:
 
 ## 业务数据库
 
-`procurement_agent/database.py` 创建并填充以下表：
+`procurement_agent/sql/<table>/schema.sql` 是数据库结构的唯一来源；每张表同目录的
+`metadata.md` 说明表用途、列语义和枚举/取值规则。`procurement_agent/database.py` 按依赖顺序
+读取这些文件完成初始化，种子数据也位于各表目录，不再在 Python 中维护建表 SQL。目录覆盖：
 
 - `products`, `inventory`, `inventory_history`
 - `suppliers`, `supplier_products`, `quotations`
@@ -282,8 +292,8 @@ with create_procurement_app(data_dir="data", model=model) as app:
 5. 写入审批及操作日志。
 
 任何订单、预算、状态、审批结果或日志步骤失败，整个语句都会回滚，不会留下部分采购申请、
-订单或预算占用。写入成功后再读取并验证事务不变量；验证失败不会返回成功。公开 Session ID
-同时写入采购申请和业务操作日志，便于按会话审计。
+订单或预算占用。数据库约束和触发器是执行不变量的原子验证边界；写 Tool 返回失败时不会报告
+成功。公开 Session ID 同时写入采购申请和业务操作日志，便于按会话审计。
 
 ## Observability 与 Metrics
 
