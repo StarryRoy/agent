@@ -3,6 +3,7 @@ name: urgent-procurement
 description: 紧急、加急采购和时间优先分析 urgent
 tags: [紧急, 加急, urgent]
 ---
+查询数据库时仅描述取数目标、业务判断和查询顺序，不写具体 SQL。查询类 SubAgent 必须结合对应表的 schema.sql 与 metadata.md 动态生成 SQL，并直接调用 Harness DatabaseToolkit.execute_query。若执行失败，读取错误并结合相同 schema/metadata 修正 SQL 后重试；成功后再交给确定性分析 Tool。
 先明确截止日期、数量、质量和预算上限，缺失条件交由 Requirement 澄清。
 Inventory 核验可用、在途、安全库存和缺口，禁止将全部库存等同可用库存。
 Main 委派 Supplier 使用 analysis_strategy=delivery_first，Pricing 使用 delivery_recovery，

@@ -36,6 +36,50 @@ SUBAGENT_TO_FIELD = {
     "execution_agent": "execution",
 }
 
+# Offline test-double output. Production models generate these statements at
+# runtime from the catalog embedded in their instructions.
+DETERMINISTIC_READ_SQL = {
+    "inventory": """SELECT p.id AS product_id, p.sku, p.name, i.current_qty,
+        i.locked_qty, i.in_transit_qty, i.safety_stock, i.updated_at,
+        COALESCE(AVG(h.consumed_qty), 0) AS average_monthly_consumption
+        FROM products p JOIN inventory i ON i.product_id = p.id
+        LEFT JOIN inventory_history h ON h.product_id = p.id WHERE p.id = :product_id
+        GROUP BY p.id, p.sku, p.name, i.current_qty, i.locked_qty,
+        i.in_transit_qty, i.safety_stock, i.updated_at""",
+    "supplier": """SELECT s.id AS supplier_id, s.code, s.name, s.status,
+        s.cooperation_status, s.risk_level, sp.min_order_qty, sp.max_capacity,
+        sp.standard_lead_days, q.unit_price, q.available_qty, q.lead_time_days,
+        COALESCE(1.0 * qr.passed_lots / NULLIF(qr.inspected_lots, 0), 0) AS quality_pass_rate,
+        COALESCE(1.0 * dr.on_time_deliveries / NULLIF(dr.deliveries, 0), 0) AS on_time_rate,
+        COALESCE(qr.severe_incidents, 0) AS severe_incidents,
+        COALESCE(dr.average_delay_days, 0) AS average_delay_days
+        FROM suppliers s JOIN supplier_products sp ON sp.supplier_id = s.id
+        JOIN quotations q ON q.supplier_id = s.id AND q.product_id = sp.product_id
+        LEFT JOIN supplier_quality_records qr ON qr.supplier_id = s.id
+        LEFT JOIN supplier_delivery_records dr ON dr.supplier_id = s.id
+        WHERE sp.product_id = :product_id AND q.status = 'valid' ORDER BY q.unit_price, s.id""",
+    "pricing": """SELECT s.id AS supplier_id, s.code, s.name, q.unit_price, q.min_qty,
+        q.available_qty, q.lead_time_days, q.quoted_at, q.valid_until,
+        AVG(ph.unit_price) AS historical_average_price, MIN(ph.unit_price) AS historical_min_price,
+        MAX(ph.unit_price) AS historical_max_price FROM quotations q
+        JOIN suppliers s ON s.id = q.supplier_id
+        LEFT JOIN purchase_history ph ON ph.supplier_id = s.id AND ph.product_id = q.product_id
+        WHERE q.product_id = :product_id AND q.status = 'valid'
+        GROUP BY s.id, s.code, s.name, q.unit_price, q.min_qty, q.available_qty,
+        q.lead_time_days, q.quoted_at, q.valid_until ORDER BY q.unit_price""",
+    "budget": """SELECT d.id AS department_id, d.code, d.name, b.fiscal_year,
+        b.total_amount, b.used_amount, b.approved_pending_amount,
+        b.total_amount - b.used_amount - b.approved_pending_amount AS available_amount
+        FROM departments d JOIN budgets b ON b.department_id = d.id
+        WHERE d.code = :code AND b.fiscal_year = :year""",
+    "risk": """SELECT s.code, s.risk_level, q.inspected_lots, q.passed_lots,
+        q.severe_incidents, q.note AS quality_note, d.deliveries, d.on_time_deliveries,
+        d.average_delay_days, d.note AS delivery_note FROM suppliers s
+        LEFT JOIN supplier_quality_records q ON q.supplier_id = s.id
+        LEFT JOIN supplier_delivery_records d ON d.supplier_id = s.id
+        WHERE s.id IN (SELECT supplier_id FROM supplier_products WHERE product_id = :product_id)""",
+}
+
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
@@ -168,19 +212,52 @@ class DeterministicProcurementModel(BaseChatModel):
             message
             for message in messages[human_index + 1 :]
             if isinstance(message, ToolMessage)
-            and message.name in {ROLE_TO_TOOL[self.role], "supplier_status"}
+            and message.name in {ROLE_TO_TOOL[self.role], "execute_query", "supplier_status"}
         ]
         primary = ROLE_TO_TOOL[self.role]
+        analysis_messages = [item for item in tool_messages if item.name == primary]
+        if self.role in DETERMINISTIC_READ_SQL:
+            parsed_task = _parse(task)
+            envelope = parsed_task if isinstance(parsed_task, dict) else {}
+            request = dict(envelope.get("request") or envelope)
+            query_messages = [item for item in tool_messages if item.name == "execute_query"]
+            if not query_messages:
+                sql = DETERMINISTIC_READ_SQL[self.role]
+                if request.get("simulate_sql_failure") and self.role == "inventory":
+                    sql = "SELECT * FROM missing_inventory_table WHERE product_id = :product_id"
+                parameters = {"product_id": request.get("product_id")}
+                if self.role == "budget":
+                    parameters = {
+                        "code": request.get("department_code", "IT"),
+                        "year": 2026,
+                    }
+                return _call("execute_query", {"sql": sql, "parameters": parameters})
+            query_result = _tool_value(query_messages[-1])
+            if isinstance(query_result, dict) and not query_result.get("ok", True):
+                # Model the documented schema-guided correction loop in offline tests.
+                return _call(
+                    "execute_query",
+                    {
+                        "sql": DETERMINISTIC_READ_SQL[self.role],
+                        "parameters": {"product_id": request.get("product_id")},
+                    },
+                )
+            if not analysis_messages:
+                envelope["database_result"] = query_result
+                envelope["source_ref"] = "DatabaseToolkit.execute_query"
+                return _call(primary, {"task": _json(envelope)})
+
         if not tool_messages:
             argument_name = "plan_json" if self.role == "execution" else "task"
             return _call(primary, {argument_name: task})
 
         if (
             self.role == "supplier"
-            and len(tool_messages) == 1
+            and analysis_messages
+            and not any(item.name == "supplier_status" for item in tool_messages)
             and "supplier_status" in self.bound_tool_names
         ):
-            analysis = _tool_value(tool_messages[0])
+            analysis = _tool_value(analysis_messages[-1])
             candidates = (
                 analysis.get("candidate_suppliers", []) if isinstance(analysis, dict) else []
             )
@@ -199,9 +276,13 @@ class DeterministicProcurementModel(BaseChatModel):
                 },
             )
 
-        if self.role == "supplier" and len(tool_messages) >= 2:
-            analysis = _tool_value(tool_messages[0])
-            external = _tool_value(tool_messages[-1])
+        if self.role == "supplier" and any(
+            item.name == "supplier_status" for item in tool_messages
+        ):
+            analysis = _tool_value(analysis_messages[-1])
+            external = _tool_value(
+                next(item for item in reversed(tool_messages) if item.name == "supplier_status")
+            )
             if not isinstance(analysis, dict):
                 analysis = {"status": "error", "error": str(analysis)}
             if isinstance(external, str) and "error" in external.casefold():

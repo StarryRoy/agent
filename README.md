@@ -56,7 +56,14 @@ cd D:\Project\agent
 Session 下一轮会释放未继续使用的 Skill；加载事件记录在现有 Trace 的 `skill.load` 中。
 Skill 负责分析方法，金额、数量、交期、预算与风险计算继续使用现有 Tool。
 
-模型输入中的 SQL 查询包会转换成业务字段和 `evidence`，保留精确数值、约束、方案、
+库存、供应商、价格、预算和风险 SubAgent 采用 Text-to-SQL：每张业务表在
+`procurement_agent/database_catalog/<table>/` 下提供完整 `schema.sql` 和字段业务语义
+`metadata.md`。Skill 只规定业务流程、判断逻辑和查询顺序；SubAgent 结合 Skill 与表目录动态
+生成只读 SQL，并直接调用 Harness `DatabaseToolkit.execute_query()`。查询错误会原样返回给
+SubAgent，由其依据同一目录修正并重试。查询完成后，库存缺口、预算、风险评分和方案组合等
+确定性计算仍由 Python Tool 执行；Execution Agent 的固定写 SQL、事务和 HITL 流程保持不变。
+
+模型输入中的查询结果会转换成业务字段和 `evidence`，保留精确数值、约束、方案、
 状态及 `source_ref`。原始 Tool 消息仍由 Harness Checkpoint 保存；需要更多事实时重新
 委派对应分析 Tool 查询。同轮被新分析替代的旧结果不再重复进入模型输入，委派只传所需依赖。
 结构化 `procurement_context` 随子任务进入既有 Session，包含目标、事实、结论、当前方案、

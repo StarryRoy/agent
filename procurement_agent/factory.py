@@ -51,13 +51,15 @@ async def _supplier_mcp_tools() -> list[Any]:
     return list(_MCP_TOOL_CACHE)
 
 
-def _instructions(role: str) -> str:
+def _instructions(role: str, database_context: str = "") -> str:
     common = (
         "你是企业采购应用的专业 SubAgent。只处理分配给你的领域，使用工具获取事实，"
         "返回稳定 JSON，不编造数据库结果。保留 Tool 的业务字段、关键数值、约束、facts、"
-        "conclusion、status、evidence 和 source_ref；不返回 SQL、queries 或原始 MCP 包装。"
+        "conclusion、status、evidence 和 source_ref；最终答复不返回 SQL 或原始 MCP 包装。"
         "基于 procurement_context 和当前任务使用已加载 Skill，必要时调用 load_skill；"
-        "Skill 只指导策略，计算和校验必须交给现有 Tool，禁止自行改写计算结果。"
+        "Skill 只指导策略，不包含具体 SQL。查询类角色必须依据所给 schema.sql 和 metadata.md"
+        "动态生成只读 SQL，直接调用 execute_query；SQL 失败时读取错误、修正后重试。查询成功后"
+        "把原始 Toolkit 结果放入 database_result，再调用领域分析 Tool 完成确定性计算。"
     )
     details = {
         "requirement": "提取产品、数量、预算、交期、质量、优先级和供应商约束；缺失字段必须明确。",
@@ -78,7 +80,7 @@ def _instructions(role: str) -> str:
         "risk": "评估履约、交付、质量、报价、集中度、历史异常和规模风险。",
         "execution": "只执行 Main Agent 已确认的采购方案，不重新决策。所有写操作使用专用工具。",
     }
-    return f"{common}{details[role]}"
+    return f"{common}{details[role]}{database_context}"
 
 
 async def create_procurement_app_async(
@@ -175,6 +177,41 @@ async def create_procurement_app_async(
         "risk": {"supplier-risk-review", "delivery-recovery", "cost-optimization"},
         "execution": set(),
     }
+    role_tables = {
+        "inventory": ("products", "inventory", "inventory_history"),
+        "supplier": (
+            "suppliers",
+            "supplier_products",
+            "quotations",
+            "supplier_quality_records",
+            "supplier_delivery_records",
+        ),
+        "pricing": ("suppliers", "quotations", "purchase_history"),
+        "budget": ("departments", "budgets"),
+        "risk": (
+            "suppliers",
+            "supplier_products",
+            "supplier_quality_records",
+            "supplier_delivery_records",
+        ),
+    }
+    catalog_root = Path(__file__).with_name("database_catalog")
+
+    def database_context(role: str) -> str:
+        if role not in role_tables:
+            return ""
+        sections = ["\n\n以下是本角色可用的数据库文件内容："]
+        for table in role_tables[role]:
+            table_root = catalog_root / table
+            sections.extend(
+                (
+                    f"\n### database_catalog/{table}/schema.sql\n"
+                    + (table_root / "schema.sql").read_text(encoding="utf-8"),
+                    f"\n### database_catalog/{table}/metadata.md\n"
+                    + (table_root / "metadata.md").read_text(encoding="utf-8"),
+                )
+            )
+        return "\n".join(sections)
 
     def model_for(role: str) -> BaseChatModel | str | None:
         if deterministic:
@@ -184,13 +221,15 @@ async def create_procurement_app_async(
     for role in ("requirement", "inventory", "supplier", "pricing", "budget", "risk", "execution"):
         selected_skills = [skill for skill in skills if skill.name in role_skills[role]]
         role_tools = [tools[role_tool_names[role]]]
+        if role in role_tables:
+            role_tools.insert(0, tools["execute_query"])
         if role == "supplier":
             role_tools.extend(mcp_tools)
         subagents.append(
             create_agent(
                 name=f"{role}_agent",
                 description=f"企业采购{role}专业分析与处理",
-                instructions=_instructions(role),
+                instructions=_instructions(role, database_context(role)),
                 model=model_for(role),
                 skills=selected_skills,
                 skill_selector=selector,

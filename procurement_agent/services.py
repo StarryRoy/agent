@@ -53,16 +53,23 @@ class ProcurementServices:
     database: DatabaseToolkit
     today: date
 
-    def _query(
-        self, subtask: str, sql: str, parameters: dict[str, Any] | list[Any] | None = None
+    def _query_result(
+        self, envelope: dict[str, Any], subtask: str
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        result = self.database.execute_query(sql, parameters)
+        """Normalize rows obtained by an Agent through Harness' DatabaseToolkit.
+
+        Read-oriented business tools deliberately do not know or execute SQL.  The
+        querying SubAgent supplies the result of its preceding ``execute_query``
+        call, leaving deterministic calculations here and database concerns in
+        Harness.
+        """
+        result = dict(envelope.get("database_result") or {})
         context = {
             "subtask": subtask,
-            "query": " ".join(sql.split()),
             "data": result,
             "facts": [],
             "conclusion": "查询成功" if result.get("ok") else "查询失败",
+            "source_ref": envelope.get("source_ref", "DatabaseToolkit.execute_query"),
         }
         return result, context
 
@@ -220,43 +227,7 @@ class ProcurementServices:
         if request.get("simulate_subagent_failure") and strategy != "fallback_recovery":
             raise RuntimeError("scripted inventory SubAgent failure")
         schema_evidence: dict[str, Any] | None = None
-        if strategy == "schema_recovery":
-            schema_evidence = self.database.get_schema("inventory")
-            if not schema_evidence.get("ok"):
-                return {
-                    "subtask": "inventory_analysis",
-                    "queries": [],
-                    "facts": [],
-                    "conclusion": "库存 Schema 恢复失败",
-                    "status": "error",
-                    "analysis_strategy": strategy,
-                    "replan_reason": envelope.get("replan_reason"),
-                    "error": schema_evidence.get("error"),
-                }
-        if strategy == "fallback_recovery":
-            sql = """
-                SELECT p.id AS product_id, p.sku, p.name, i.current_qty, i.locked_qty,
-                       i.in_transit_qty, i.safety_stock, i.updated_at
-                FROM products p JOIN inventory i ON i.product_id = p.id
-                WHERE p.id = :product_id
-            """
-        else:
-            sql = """
-                SELECT p.id AS product_id, p.sku, p.name, i.current_qty, i.locked_qty,
-                       i.in_transit_qty, i.safety_stock, i.updated_at,
-                       COALESCE(AVG(h.consumed_qty), 0) AS average_monthly_consumption
-                FROM products p
-                JOIN inventory i ON i.product_id = p.id
-                LEFT JOIN inventory_history h ON h.product_id = p.id
-                WHERE p.id = :product_id
-                GROUP BY p.id, p.sku, p.name, i.current_qty, i.locked_qty,
-                         i.in_transit_qty, i.safety_stock, i.updated_at
-            """
-        if request.get("simulate_sql_failure") and strategy != "schema_recovery":
-            sql = "SELECT * FROM missing_inventory_table WHERE product_id = :product_id"
-        result, query = self._query(
-            "inventory_and_consumption", sql, {"product_id": request.get("product_id")}
-        )
+        result, query = self._query_result(envelope, "inventory_and_consumption")
         records = _rows(result)
         if not records:
             return {
@@ -321,25 +292,7 @@ class ProcurementServices:
             and strategy != "fallback_recovery"
         ):
             raise RuntimeError("scripted supplier SubAgent failure")
-        sql = """
-            SELECT s.id AS supplier_id, s.code, s.name, s.status, s.cooperation_status,
-                   s.risk_level, sp.min_order_qty, sp.max_capacity, sp.standard_lead_days,
-                   q.unit_price, q.available_qty, q.lead_time_days,
-                   COALESCE(1.0 * qr.passed_lots / NULLIF(qr.inspected_lots, 0), 0) AS quality_pass_rate,
-                   COALESCE(1.0 * dr.on_time_deliveries / NULLIF(dr.deliveries, 0), 0) AS on_time_rate,
-                   COALESCE(qr.severe_incidents, 0) AS severe_incidents,
-                   COALESCE(dr.average_delay_days, 0) AS average_delay_days
-            FROM suppliers s
-            JOIN supplier_products sp ON sp.supplier_id = s.id
-            JOIN quotations q ON q.supplier_id = s.id AND q.product_id = sp.product_id
-            LEFT JOIN supplier_quality_records qr ON qr.supplier_id = s.id
-            LEFT JOIN supplier_delivery_records dr ON dr.supplier_id = s.id
-            WHERE sp.product_id = :product_id AND q.status = 'valid'
-            ORDER BY q.unit_price, s.id
-        """
-        result, query = self._query(
-            "supplier_capability_and_history", sql, {"product_id": request.get("product_id")}
-        )
+        result, query = self._query_result(envelope, "supplier_capability_and_history")
         excluded = set(request.get("excluded_suppliers") or [])
         qty = int(inventory.get("recommended_purchase_quantity") or request.get("quantity") or 0)
         days = _days_until(request.get("latest_delivery_date"), self.today)
@@ -398,23 +351,7 @@ class ProcurementServices:
         strategy = str(envelope.get("analysis_strategy") or "balanced")
         candidates = list(supplier_analysis.get("candidate_suppliers") or [])
         qty = int(inventory.get("recommended_purchase_quantity") or request.get("quantity") or 0)
-        sql = """
-            SELECT s.id AS supplier_id, s.code, s.name, q.unit_price, q.min_qty,
-                   q.available_qty, q.lead_time_days, q.quoted_at, q.valid_until,
-                   AVG(ph.unit_price) AS historical_average_price,
-                   MIN(ph.unit_price) AS historical_min_price,
-                   MAX(ph.unit_price) AS historical_max_price
-            FROM quotations q
-            JOIN suppliers s ON s.id = q.supplier_id
-            LEFT JOIN purchase_history ph ON ph.supplier_id = s.id AND ph.product_id = q.product_id
-            WHERE q.product_id = :product_id AND q.status = 'valid'
-            GROUP BY s.id, s.code, s.name, q.unit_price, q.min_qty, q.available_qty,
-                     q.lead_time_days, q.quoted_at, q.valid_until
-            ORDER BY q.unit_price
-        """
-        result, query = self._query(
-            "current_and_historical_prices", sql, {"product_id": request.get("product_id")}
-        )
+        result, query = self._query_result(envelope, "current_and_historical_prices")
         candidate_codes = {item.get("code") for item in candidates}
         external = supplier_analysis.get("external_status") or {}
         quotes: list[dict[str, Any]] = []
@@ -643,18 +580,7 @@ class ProcurementServices:
         strategy = str(envelope.get("analysis_strategy") or "standard")
         request = dict(envelope.get("request") or {})
         pricing = dict(envelope.get("pricing_analysis") or {})
-        sql = """
-            SELECT d.id AS department_id, d.code, d.name, b.fiscal_year,
-                   b.total_amount, b.used_amount, b.approved_pending_amount,
-                   b.total_amount - b.used_amount - b.approved_pending_amount AS available_amount
-            FROM departments d JOIN budgets b ON b.department_id = d.id
-            WHERE d.code = :code AND b.fiscal_year = :year
-        """
-        result, query = self._query(
-            "department_budget",
-            sql,
-            {"code": request.get("department_code", "IT"), "year": self.today.year},
-        )
+        result, query = self._query_result(envelope, "department_budget")
         records = _rows(result)
         if not records:
             return {
@@ -708,18 +634,7 @@ class ProcurementServices:
         pricing = dict(envelope.get("pricing_analysis") or {})
         budget = dict(envelope.get("budget_analysis") or {})
         candidates = {item["code"]: item for item in supplier.get("candidate_suppliers") or []}
-        sql = """
-            SELECT s.code, s.risk_level, q.inspected_lots, q.passed_lots,
-                   q.severe_incidents, q.note AS quality_note, d.deliveries,
-                   d.on_time_deliveries, d.average_delay_days, d.note AS delivery_note
-            FROM suppliers s
-            LEFT JOIN supplier_quality_records q ON q.supplier_id = s.id
-            LEFT JOIN supplier_delivery_records d ON d.supplier_id = s.id
-            WHERE s.id IN (SELECT supplier_id FROM supplier_products WHERE product_id = :product_id)
-        """
-        result, query = self._query(
-            "supplier_risk_records", sql, {"product_id": request.get("product_id")}
-        )
+        result, query = self._query_result(envelope, "supplier_risk_records")
         records = {row["code"]: row for row in _rows(result)}
         effective_budget = float(budget.get("effective_available_budget") or 0)
         assessed: list[dict[str, Any]] = []
@@ -1001,6 +916,19 @@ class ProcurementServices:
                 description=description,
                 metadata=metadata,
             )
+        result["execute_query"] = StructuredTool.from_function(
+            self.database.execute_query,
+            name="execute_query",
+            description=(
+                "Execute one read-only SQL query generated from the supplied schema.sql and "
+                "metadata.md. On failure inspect the returned error, correct the SQL, and retry."
+            ),
+            metadata={
+                "database_toolkit": True,
+                "database_operation": "read",
+                "business_domain": "procurement",
+            },
+        )
         result["execute_procurement_plan"].metadata.update(
             {
                 "harness_approval": True,
