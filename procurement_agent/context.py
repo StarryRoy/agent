@@ -208,4 +208,19 @@ class ProcurementContextMiddleware(AgentMiddleware):
                     + json.dumps(context, ensure_ascii=False)
                 ),
             )
+        # Gemini 3.x rejects model prefilling: a structured-output request may
+        # not end with the Agent's AIMessage. Harness already binds the native
+        # JSON schema formatter; give that format-only call a final user turn
+        # without changing the normal Agent/Tool conversation.
+        if request.purpose == "format" and (
+            not messages or not isinstance(messages[-1], (HumanMessage, ToolMessage))
+        ):
+            messages.append(
+                HumanMessage(
+                    content=(
+                        "请将上面的最终结果转换为要求的结构化输出。"
+                        "只使用已有业务事实，不要补充或修改结论。"
+                    )
+                )
+            )
         request.messages = messages

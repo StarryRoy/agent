@@ -6,7 +6,7 @@ from datetime import date
 import pytest
 from agent_harness import ModelRequest
 from agent_harness.middleware import AgentExecution
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from procurement_agent import create_procurement_app
 from procurement_agent.context import ProcurementContextMiddleware, task_view
@@ -113,3 +113,20 @@ def test_context_preserves_gap_plan_and_raw_checkpoint_message():
     assert "budget_analysis" not in task and "pricing_analysis" not in task
     assert task["procurement_context"]["budget_gap"] == 123.45
     assert task["procurement_context"]["current_plan"] == plan
+
+
+def test_format_request_ends_with_user_message_for_gemini_structured_output():
+    messages = [HumanMessage(content="采购500台设备"), AIMessage(content="最终采购方案")]
+    request = ModelRequest(
+        AgentExecution("main", {}, session_id="format-context"),
+        {"messages": messages},
+        list(messages),
+        {},
+        purpose="format",
+        response_format={"type": "object"},
+    )
+
+    ProcurementContextMiddleware().before_model(request)
+
+    assert isinstance(request.messages[-1], HumanMessage)
+    assert request.messages[-2] == messages[-1]

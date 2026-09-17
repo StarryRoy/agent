@@ -5,7 +5,7 @@
 Harness 原生 HITL 在持久化 Checkpoint 上暂停和恢复。
 
 正式应用默认由 `langchain-google-genai` 的 `ChatGoogleGenerativeAI` 驱动 Harness
-Agent/Tool 循环，模型集中配置为 `gemini-3.5-flash-lite`，并通过 `thinking_budget=0` 关闭思考；
+Agent/Tool 循环，模型集中配置为 `gemini-3.5-flash-lite`，并使用 `thinking_level="minimal"`；
 API Key 只从系统环境变量 `GEMINI_API_KEY` 读取。Main Agent 根据会话证据动态选择和协调
 SubAgent；显式传入的 `model` 或 `role_models` 仍可覆盖默认模型，项目不会在未配置 Key 时隐式
 退回 Python 规则。SubAgent 单次运行超时为 60 秒，Main Agent 为 90 秒。
@@ -87,7 +87,7 @@ $env:GEMINI_API_KEY = "your-gemini-api-key"
 ```
 
 启动器会弹出模式选择窗口。Demo 模式直接使用确定性模型且无需 API Key；Real 模式默认使用
-`gemini-3.5-flash-lite`（关闭思考）和 `GEMINI_API_KEY`，无需额外配置 Harness 默认模型。
+`gemini-3.5-flash-lite`（minimal 思考级别）和 `GEMINI_API_KEY`，无需额外配置 Harness 默认模型。
 选择后会自动启动 FastAPI 和前端静态服务，并打开浏览器；在启动窗口按 `Ctrl+C` 会尽量正常
 停止两个子进程。可用
 `PROCUREMENT_BACKEND_PORT` 和 `PROCUREMENT_FRONTEND_PORT` 调整端口。

@@ -57,11 +57,17 @@ def _create_gemini_model() -> ChatGoogleGenerativeAI:
             f"Real mode requires the {GEMINI_API_KEY_ENV} environment variable. "
             "Set it before starting the application, or pass model/role_models explicitly."
         )
-    return ChatGoogleGenerativeAI(
+    model = ChatGoogleGenerativeAI(
         model=GEMINI_MODEL_NAME,
         api_key=api_key,
-        thinking_budget=0,
+        thinking_level="minimal",
     )
+    # langchain-google-genai 4.4.0 injects candidate_count=1 by default, but
+    # Gemini 3.x rejects candidate_count. Setting its internal alias to None
+    # makes the request serializer omit the unsupported field entirely.
+    if getattr(model, "model", None) == GEMINI_MODEL_NAME and hasattr(model, "n"):
+        model.n = None
+    return model
 
 
 async def _supplier_mcp_tools() -> list[Any]:

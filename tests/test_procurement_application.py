@@ -268,7 +268,7 @@ def test_production_factory_creates_one_default_gemini_for_all_agents(
             {
                 "model": factory_module.GEMINI_MODEL_NAME,
                 "api_key": "test-gemini-key",
-                "thinking_budget": 0,
+                "thinking_level": "minimal",
             }
         ]
         assert application.agent.definition.model is default_model
