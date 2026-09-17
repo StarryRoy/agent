@@ -99,6 +99,9 @@ class DeterministicProcurementModel(BaseChatModel):
     """Explicit test double; production composition never selects it implicitly."""
 
     role: str
+    profile: dict[str, Any] = Field(
+        default_factory=lambda: {"max_input_tokens": 128_000}, exclude=True
+    )
     bound_tool_names: list[str] = Field(default_factory=list, exclude=True)
 
     @property

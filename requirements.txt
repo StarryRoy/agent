@@ -1,4 +1,4 @@
-agent-harness @ git+https://github.com/StarryRoy/harness.git@codex
+-e D:/Project/harness
 langgraph-checkpoint-sqlite>=3,<4
 langchain-mcp-adapters>=0.1,<1
 pydantic>=2.7,<3
