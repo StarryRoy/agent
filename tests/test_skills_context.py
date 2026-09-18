@@ -11,7 +11,10 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from procurement_agent import create_procurement_app
 from procurement_agent.context import ProcurementContextMiddleware, task_view
-from procurement_agent.middleware import ProcurementOrchestrationMiddleware
+from procurement_agent.middleware import (
+    ProcurementBusinessToolMiddleware,
+    ProcurementOrchestrationMiddleware,
+)
 from procurement_agent.test_runtime import current_test_config
 
 
@@ -77,7 +80,7 @@ def test_replanning_skills_are_loaded_only_by_main_agent(tmp_path, text, skill):
         app.close()
 
 
-def test_context_preserves_gap_plan_and_raw_checkpoint_message():
+def test_context_uses_persistent_state_and_never_rebuilds_it_from_tool_messages():
     budget = {
         "over_budget_amount": 123.45,
         "effective_available_budget": 1000,
@@ -93,21 +96,22 @@ def test_context_preserves_gap_plan_and_raw_checkpoint_message():
         ],
     }
     original = ToolMessage(content=json.dumps(budget), name="budget_agent", tool_call_id="budget-1")
-    request = ModelRequest(
-        AgentExecution("main", {}, session_id="context"), {"messages": [original]}, [original], {}
-    )
+    canonical_budget = {"status": "success", "over_budget_amount": 999.0}
+    state = {
+        "messages": [original],
+        "procurement_results": {"budget_analysis": canonical_budget},
+    }
+    request = ModelRequest(AgentExecution("main", state, session_id="context"), state, [original], {})
     ProcurementContextMiddleware().before_model(request)
     view = str(request.messages)
     assert "secret_raw_rows" not in view
     assert "budget-1" in view and "123.45" in view
     assert "secret_raw_rows" in original.content
-    plan = {"plan_id": "PLAN-1", "total_cost": 1123.45, "quantity": 10}
     task = task_view(
         "pricing_agent",
         {
             "request": {"budget": 1000},
             "budget_analysis": budget,
-            "pricing_analysis": {"recommended_price_plan": plan},
             "replan_reason": "all_suppliers_over_budget",
             "test_config": {
                 "simulate_sql_failure": False,
@@ -119,8 +123,9 @@ def test_context_preserves_gap_plan_and_raw_checkpoint_message():
         },
     )
     assert "budget_analysis" not in task and "pricing_analysis" not in task
-    assert task["procurement_context"]["budget_gap"] == 123.45
-    assert task["procurement_context"]["current_plan"] == plan
+    assert request.state["procurement_results"]["budget_analysis"] == canonical_budget
+    assert "procurement_results" not in request.execution.metadata
+    assert "procurement_context" not in task
     assert "test_config" not in task
 
 
@@ -182,6 +187,114 @@ def test_requirement_delegation_recovers_original_user_text_from_parent_executio
     assert observed["config"].simulate_sql_failure is True
     assert observed["config"].simulate_execution_failure is False
     assert current_test_config() is None
+
+
+def test_subagent_dependency_gate_validates_the_whole_model_batch_from_round_start():
+    state = {
+        "procurement_results": {
+            "requirement": {"request": {"quantity": 500, "budget": 800000}},
+            "inventory_analysis": {
+                "status": "success",
+                "recommended_purchase_quantity": 445,
+            },
+        }
+    }
+    execution = AgentExecution("main", state, session_id="dependency-gate")
+    middleware = ProcurementOrchestrationMiddleware()
+    middleware.before_agent(execution)
+    model_request = ModelRequest(execution, state, [], {})
+    ProcurementContextMiddleware().before_model(model_request)
+    response = AIMessage(
+        content="",
+        tool_calls=[
+            {"name": "supplier_agent", "args": {"task": "{}"}, "id": "supplier-ready"},
+            {"name": "pricing_agent", "args": {"task": "{}"}, "id": "pricing-too-early"},
+            {"name": "load_skill", "args": {"name": "cost-optimization"}, "id": "ordinary"},
+        ],
+    )
+    middleware.after_model(model_request, response)
+
+    pricing = ToolRequest(
+        execution,
+        SimpleNamespace(name="pricing_agent"),
+        {"task": json.dumps({"request": {"quantity": 999}})},
+        {},
+        "pricing-too-early",
+        state,
+    )
+    pricing_executed = False
+
+    def execute_pricing(_request):
+        nonlocal pricing_executed
+        pricing_executed = True
+
+    observation = middleware.wrap_tool_call(pricing, execute_pricing)
+    assert pricing_executed is False
+    assert observation["error_type"] == "dependency_conflict"
+    assert observation["missing_dependencies"] == ["supplier_analysis"]
+
+    supplier = ToolRequest(
+        execution,
+        SimpleNamespace(name="supplier_agent"),
+        {"task": json.dumps({"request": {"quantity": 999}})},
+        {},
+        "supplier-ready",
+        state,
+    )
+    middleware.wrap_tool_call(supplier, lambda request: {"status": "error"})
+    task = json.loads(supplier.arguments["task"])
+    assert task["request"]["quantity"] == 500
+    assert task["inventory_analysis"]["recommended_purchase_quantity"] == 445
+    assert "procurement_context" not in task
+
+    ordinary = ToolRequest(
+        execution,
+        SimpleNamespace(name="load_skill"),
+        {"name": "cost-optimization"},
+        {},
+        "ordinary",
+    )
+    assert middleware.wrap_tool_call(ordinary, lambda _request: "executed") == "executed"
+
+
+def test_business_tool_inputs_are_pinned_to_subagent_structured_task():
+    confirmed = {
+        "request": {"quantity": 445},
+        "inventory_analysis": {"recommended_purchase_quantity": 445},
+        "supplier_analysis": {"required_quantity": 445, "remarks": None},
+        "analysis_strategy": "standard",
+        "replan_reason": None,
+    }
+    execution = AgentExecution(
+        "pricing_agent",
+        {"messages": [HumanMessage(content=json.dumps(confirmed))]},
+    )
+    request = ToolRequest(
+        execution,
+        SimpleNamespace(name="calculate_pricing"),
+        {
+            "request": {"quantity": 500},
+            "inventory_analysis": {"recommended_purchase_quantity": 500},
+            "supplier_analysis": {"required_quantity": 500},
+            "query_result": {"ok": True},
+            "analysis_strategy": "standard",
+            "replan_reason": None,
+        },
+        {},
+        "pricing-calculator",
+    )
+    observed = {}
+
+    def call_next(tool_request):
+        observed.update(tool_request.arguments)
+        return {"status": "success"}
+
+    ProcurementBusinessToolMiddleware().wrap_tool_call(request, call_next)
+    assert observed["request"]["quantity"] == 445
+    assert observed["inventory_analysis"]["recommended_purchase_quantity"] == 445
+    assert observed["supplier_analysis"]["required_quantity"] == 445
+    assert "remarks" not in observed["supplier_analysis"]
+    assert observed["query_result"] == {"ok": True}
 
 
 def test_production_context_does_not_enable_fault_injection_metadata():

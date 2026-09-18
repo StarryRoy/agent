@@ -5,13 +5,13 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import BaseTool, StructuredTool
@@ -222,7 +222,12 @@ class DeterministicProcurementModel(BaseChatModel):
         tool_choice: str | None = None,
         **kwargs: Any,
     ) -> DeterministicProcurementModel:
-        self.bound_tool_names = [getattr(tool, "name", str(tool)) for tool in tools]
+        self.bound_tool_names = [
+            str(tool.get("function", {}).get("name"))
+            if isinstance(tool, Mapping) and tool.get("function", {}).get("name")
+            else getattr(tool, "name", str(tool))
+            for tool in tools
+        ]
         return self
 
     def with_structured_output(self, schema: Any, **kwargs: Any) -> RunnableLambda:
@@ -252,6 +257,14 @@ class DeterministicProcurementModel(BaseChatModel):
         **kwargs: Any,
     ) -> ChatResult:
         message = self._main(messages) if self.role == "main" else self._subagent(messages)
+        if (
+            "agent_harness_structured_response" in self.bound_tool_names
+            and not message.tool_calls
+            and message.content
+        ):
+            value = _parse(message.content)
+            if isinstance(value, dict):
+                message = _call("agent_harness_structured_response", value)
         message.response_metadata = {
             "token_usage": {
                 "input_tokens": sum(max(len(_human_text(item)) // 4, 1) for item in messages),
@@ -395,9 +408,34 @@ class DeterministicProcurementModel(BaseChatModel):
         if human_index < 0:
             return AIMessage(content=_json(self._empty_result("未收到采购需求")))
         text = _human_text(messages[human_index])
-        previous = self._results(messages[:human_index])
         current_messages = messages[human_index + 1 :]
-        current = self._results(current_messages)
+        persisted = self._persistent_results(messages)
+        current_fields = self._result_fields(current_messages)
+        # The deterministic model mirrors production's rule: values come only
+        # from the State projection, never by rehydrating business facts from
+        # prior ToolMessages. ToolMessages identify work done in this turn.
+        if persisted:
+            current = {
+                field: persisted[field] for field in current_fields if field in persisted
+            }
+            # Failed calls do not create business State. Keep their transient
+            # error observation only so the deterministic coordinator can
+            # select its retry/reject path; successful facts still come solely
+            # from the State projection above.
+            message_results = self._results(current_messages)
+            current.update(
+                {
+                    field: message_results[field]
+                    for field in current_fields
+                    if field not in current and field in message_results
+                }
+            )
+            previous = {
+                field: value for field, value in persisted.items() if field not in current_fields
+            }
+        else:
+            previous = self._results(messages[:human_index])
+            current = self._results(current_messages)
         current_counts = self._counts(current_messages)
 
         if "requirement" not in current:
@@ -418,6 +456,7 @@ class DeterministicProcurementModel(BaseChatModel):
 
         route = self._route(text, bool(previous.get("requirement")))
         combined = {**previous, **current, "requirement": request_result}
+        route = self._route_with_available_dependencies(route, combined)
         inventory = combined.get("inventory_analysis", {})
         if inventory and inventory.get("recommended_purchase_quantity") == 0:
             result = self._assemble(combined, approval="not_required", execution="not_required")
@@ -603,6 +642,56 @@ class DeterministicProcurementModel(BaseChatModel):
             if isinstance(value, dict):
                 results[SUBAGENT_TO_FIELD[message.name]] = value
         return results
+
+    @staticmethod
+    def _result_fields(messages: Sequence[BaseMessage]) -> set[str]:
+        return {
+            SUBAGENT_TO_FIELD[message.name]
+            for message in messages
+            if isinstance(message, ToolMessage) and message.name in SUBAGENT_TO_FIELD
+        }
+
+    @staticmethod
+    def _persistent_results(messages: Sequence[BaseMessage]) -> dict[str, dict[str, Any]]:
+        prefix = "以下是应用层持久化业务 State，也是当前采购业务唯一正式事实源。"
+        for message in messages:
+            if not isinstance(message, SystemMessage) or not isinstance(message.content, str):
+                continue
+            if not message.content.startswith(prefix):
+                continue
+            _, separator, payload = message.content.partition("\n")
+            value = _parse(payload) if separator else {}
+            return value if isinstance(value, dict) else {}
+        return {}
+
+    @staticmethod
+    def _route_with_available_dependencies(
+        route: list[str], results: Mapping[str, Any]
+    ) -> list[str]:
+        dependencies = {
+            "inventory_analysis": ("requirement",),
+            "supplier_analysis": ("requirement", "inventory_analysis"),
+            "pricing_analysis": ("requirement", "inventory_analysis", "supplier_analysis"),
+            "budget_analysis": ("requirement", "pricing_analysis"),
+            "risk_analysis": (
+                "requirement",
+                "supplier_analysis",
+                "pricing_analysis",
+                "budget_analysis",
+            ),
+        }
+        if any(
+            any(not isinstance(results.get(field), Mapping) for field in dependencies[stage])
+            for stage in route
+        ):
+            return [
+                "inventory_analysis",
+                "supplier_analysis",
+                "pricing_analysis",
+                "budget_analysis",
+                "risk_analysis",
+            ]
+        return route
 
     @staticmethod
     def _counts(messages: Sequence[BaseMessage]) -> dict[str, int]:

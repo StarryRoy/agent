@@ -22,12 +22,17 @@ class ProcurementSkillMiddleware(AgentMiddleware):
             (decode(m.content) for m in reversed(request.messages) if isinstance(m, HumanMessage)),
             {},
         )
-        context = request.execution.metadata.get("procurement_context", {})
+        results = request.state.get("procurement_results", {})
+        results = results if isinstance(results, dict) else {}
         # Match current task/replan only, never stale raw history or catalog descriptions.
         if self.role == "main":
-            reason = context.get("replan_reason") or ""
-            goal = context.get("goal") or task
-            gap = context.get("budget_gap")
+            risk = results.get("risk_analysis", {})
+            pricing = results.get("pricing_analysis", {})
+            budget = results.get("budget_analysis", {})
+            requirement = results.get("requirement", {})
+            reason = risk.get("replan_reason") or pricing.get("replan_reason") or ""
+            goal = requirement.get("request") or task
+            gap = budget.get("over_budget_amount")
         else:
             envelope = task if isinstance(task, dict) else {}
             reason = (
@@ -36,7 +41,7 @@ class ProcurementSkillMiddleware(AgentMiddleware):
                 + str(envelope.get("analysis_strategy") or "")
             )
             goal = envelope.get("request", task)
-            gap = envelope.get("procurement_context", {}).get("budget_gap")
+            gap = envelope.get("budget_analysis", {}).get("over_budget_amount")
         query = None
         if self.role != "main" and self.skills:
             # Query SubAgents each receive exactly one normal domain Skill.

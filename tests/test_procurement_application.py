@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date
 
 import pytest
+from agent_harness import AgentMiddleware
 from langchain_core.language_models import FakeListChatModel
 
 from procurement_agent import create_procurement_app
@@ -192,6 +193,47 @@ def test_checkpoint_survives_application_restart(tmp_path):
         assert result.data["execution_status"] == "success"
     finally:
         second.close()
+
+
+def test_same_session_invoke_restores_procurement_results_without_input_state(app):
+    """Validated business State survives a completed turn and is usable next turn."""
+
+    session_id = "state-update-same-session"
+    first = app.agent.invoke("下个月需要50台设备，预算20万。", session_id=session_id)
+    assert first.status == "completed"
+    persisted = first.state["procurement_results"]
+    assert persisted["requirement"]["request"]["quantity"] == 50
+    assert persisted["inventory_analysis"]["recommended_purchase_quantity"] == 0
+
+    observed: list[dict] = []
+
+    class CaptureRestoredState(AgentMiddleware):
+        def before_model(self, request):
+            if not observed:
+                observed.append(
+                    {
+                        "results": dict(request.state.get("procurement_results", {})),
+                        "metadata_has_business_state": "procurement_results"
+                        in request.execution.metadata,
+                    }
+                )
+
+    # The next call supplies only user text. This observer runs at the first
+    # model step of that second invoke, after normal context preparation.
+    pipeline = app.agent.runtime.middleware
+    pipeline.middleware = (*pipeline.middleware, CaptureRestoredState())
+    second = app.agent.invoke("采用第一方案。", session_id=session_id)
+
+    assert second.status == "completed"
+    assert second.state["procurement_results"]["inventory_analysis"][
+        "recommended_purchase_quantity"
+    ] == 0
+    assert observed == [
+        {
+            "results": persisted,
+            "metadata_has_business_state": False,
+        }
+    ]
 
 
 def test_mcp_supplier_status_is_observed_and_can_fallback(tmp_path):

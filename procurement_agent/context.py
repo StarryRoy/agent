@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from typing import Any
 
 from agent_harness import AgentMiddleware, ModelRequest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+
+from .business_validation import FIELD_BY_AGENT
 
 
 def decode(value: Any) -> Any:
@@ -52,15 +55,7 @@ def business_view(value: Any) -> Any:
     return result
 
 
-FIELDS = {
-    "requirement_agent": "requirement",
-    "inventory_agent": "inventory_analysis",
-    "supplier_agent": "supplier_analysis",
-    "pricing_agent": "pricing_analysis",
-    "budget_agent": "budget_analysis",
-    "risk_agent": "risk_analysis",
-    "execution_agent": "execution",
-}
+FIELDS = FIELD_BY_AGENT
 
 # Only pass each Tool's actual dependencies, preserving exact plans and constraints.
 DEPENDENCIES = {
@@ -74,52 +69,16 @@ DEPENDENCIES = {
 }
 
 
-def procurement_context(results: dict, goal: Any = None) -> dict:
-    requirement = results.get("requirement", {})
-    budget = results.get("budget_analysis", {})
-    pricing = results.get("pricing_analysis", {})
-    risk = results.get("risk_analysis", {})
-    request = requirement.get("request", goal or {})
-    return {
-        "goal": request,
-        "confirmed_facts": {key: value.get("facts", []) for key, value in results.items()},
-        "conclusions": {
-            key: {"status": value.get("status"), "conclusion": value.get("conclusion")}
-            for key, value in results.items()
-        },
-        "current_plan": risk.get("recommended_plan") or pricing.get("recommended_price_plan"),
-        "budget_gap": budget.get("over_budget_amount"),
-        "effective_budget": budget.get("effective_available_budget"),
-        "risks": risk.get("main_risks", []),
-        "replan_reason": risk.get("replan_reason"),
-        "evidence": {key: value.get("evidence", []) for key, value in results.items()},
-        "source_ref": {key: value.get("source_ref") for key, value in results.items()},
-    }
-
-
 def task_view(name: str, task: dict) -> dict:
     task = business_view(task)
     if name not in DEPENDENCIES:
         return task
-    results = {
-        key: value
-        for key, value in task.items()
-        if key.endswith("_analysis") and isinstance(value, dict)
-    }
-    context = task.get("procurement_context") or procurement_context(results, task.get("request"))
-    context = {
-        **context,
-        "replan_reason": task.get("replan_reason") or context.get("replan_reason"),
-    }
     allowed = DEPENDENCIES[name] | {
         "analysis_strategy",
         "replan_reason",
         "replan_start",
     }
-    return {
-        **{key: value for key, value in task.items() if key in allowed},
-        "procurement_context": context,
-    }
+    return {key: value for key, value in task.items() if key in allowed}
 
 
 class ProcurementContextMiddleware(AgentMiddleware):
@@ -153,7 +112,11 @@ class ProcurementContextMiddleware(AgentMiddleware):
             break
 
         messages = []
-        results = {}
+        state_results = request.state.get("procurement_results")
+        results = state_results if isinstance(state_results, Mapping) else {}
+        # Freeze the facts visible before this model call. Batch dependency
+        # validation must not be affected by earlier calls from the same response.
+        request.execution.metadata["procurement_round_state"] = dict(results)
         # Preserve call/response pairs and counters, but omit replaced results within a turn.
         latest = {}
         superseded = set()
@@ -166,44 +129,10 @@ class ProcurementContextMiddleware(AgentMiddleware):
                 latest[item.name] = item.tool_call_id
         for item in request.messages:
             if isinstance(item, ToolMessage) and item.name not in {"load_skill", "unload_skill"}:
-                if item.name in FIELDS:
-                    # A new analysis invalidates downstream context until revalidated.
-                    downstream = {
-                        "requirement_agent": list(results),
-                        "inventory_agent": [
-                            "supplier_analysis",
-                            "pricing_analysis",
-                            "budget_analysis",
-                            "risk_analysis",
-                        ],
-                        "supplier_agent": [
-                            "pricing_analysis",
-                            "budget_analysis",
-                            "risk_analysis",
-                        ],
-                        "pricing_agent": ["budget_analysis", "risk_analysis"],
-                        "budget_agent": ["risk_analysis"],
-                    }
-                    for key in downstream.get(item.name, []):
-                        results.pop(key, None)
-
-                # request.messages already reflects Harness compaction and tool-result
-                # limits. Never recover a fuller copy from request.state.
+                # Tool messages are model context only. Formal business State is
+                # never reconstructed from chat history.
                 value = business_view(decode(item.content))
                 if isinstance(value, dict):
-                    payload = value.get("content", value)
-                    if isinstance(payload, dict):
-                        payload.setdefault(
-                            "source_ref",
-                            {
-                                "session_id": request.execution.session_id,
-                                "tool_call_id": item.tool_call_id,
-                                "tool": item.name,
-                                "storage": "Harness checkpoint / trace",
-                            },
-                        )
-                        if item.name in FIELDS:
-                            results[FIELDS[item.name]] = payload
                     if item.tool_call_id in superseded:
                         value = {"superseded": True, "tool_call_id": item.tool_call_id}
                     item = item.model_copy(
@@ -230,14 +159,14 @@ class ProcurementContextMiddleware(AgentMiddleware):
                     )
             messages.append(item)
         if results:
-            context = procurement_context(results)
-            # Derive durable business facts from retained structured results, not raw history.
-            request.execution.metadata["procurement_context"] = context
             messages.insert(
-                1,
+                1 if messages and isinstance(messages[0], SystemMessage) else 0,
                 SystemMessage(
-                    content="当前采购业务 Context（最新用户修改优先于历史事实）：\n"
-                    + json.dumps(context, ensure_ascii=False)
+                    content=(
+                        "以下是应用层持久化业务 State，也是当前采购业务唯一正式事实源。"
+                        "历史 ToolMessage 如与其冲突，以此 State 为准：\n"
+                        + json.dumps(results, ensure_ascii=False)
+                    )
                 ),
             )
         # Gemini 3.x rejects model prefilling: a structured-output request may

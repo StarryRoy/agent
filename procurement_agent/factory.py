@@ -23,15 +23,16 @@ from agent_harness import (
 from langchain_core.language_models import BaseChatModel
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
+from pydantic import TypeAdapter
 
 from .application import ProcurementApplication
 from .context import ProcurementContextMiddleware
 from .database import ProcurementSQLiteBackend, initialize_database
 from .metrics import JsonLinesEventSink, ObservedDatabaseToolkit, ProcurementMetricSink
-from .middleware import ProcurementOrchestrationMiddleware
+from .middleware import ProcurementBusinessToolMiddleware, ProcurementOrchestrationMiddleware
 from .models import DeterministicProcurementModel, build_mock_execute_query_tool
 from .persistence import PersistentSQLiteSaver
-from .schemas import ProcurementAnalysis, ProcurementDecision, ProcurementState
+from .schemas import SUBAGENT_OUTPUT_TYPES, ProcurementDecision, ProcurementState
 from .services import ProcurementServices
 from .skill_policy import ProcurementSkillMiddleware
 from .sql_catalog import role_database_context
@@ -140,8 +141,9 @@ async def _supplier_mcp_tools() -> list[Any]:
 def _instructions(role: str, business_today: date) -> str:
     common = (
         "你是企业采购应用的专业 SubAgent。只处理分配给你的领域，使用工具获取事实，"
-        "返回稳定 JSON，不编造数据库结果。保留 Tool 的业务字段、关键数值、约束、facts、"
-        "conclusion、status、evidence 和 source_ref；最终结果不返回 SQL 或原始 MCP 包装。"
+        "严格按本角色独立输出 Schema 返回 JSON，不编造数据库结果。核心字段必须完整，场景外"
+        "补充信息只写入 remarks。原样保留计算 Tool 已确认的数量、金额、方案及 evidence，"
+        "不得通过 facts/conclusion 摘要重建或改写；最终结果不返回 SQL 或原始 MCP 包装。"
         "若本角色提供 Skill，必须先加载并遵循。查询角色先根据 Skill、Schema 和 Metadata 动态生成 SQL，"
         "直接调用 Harness execute_query；返回 ok=false 时把 Harness error 作为反馈，修正 SQL 后"
         "重试，成功且字段契约完整后才调用确定性计算 Tool。不得让计算 Tool 生成或执行 SQL。"
@@ -313,10 +315,11 @@ async def create_procurement_app_async(
                 model=model_for(role),
                 skills=selected_skills,
                 skill_selector=selector,
-                response_format=ProcurementAnalysis.model_json_schema(),
+                response_format=TypeAdapter(SUBAGENT_OUTPUT_TYPES[f"{role}_agent"]).json_schema(),
                 middleware=[
                     ProcurementContextMiddleware(),
                     ProcurementSkillMiddleware(role, selected_skills, selector),
+                    ProcurementBusinessToolMiddleware(),
                 ],
                 tools=role_tools,
                 runtime_config=sub_config,
@@ -331,10 +334,15 @@ async def create_procurement_app_async(
         instructions=(
             "你是企业采购 Main Agent，由你基于对话上下文动态选择、组合和重复调用专业 SubAgent，"
             "首次调用 requirement_agent 时，task.text 必须原样携带当前用户的采购消息，不得只传"
-            "空 procurement_context；修改会话时携带最新用户修改文本。"
-            "禁止按预设固定流水线机械调用。先判断已有证据和缺失字段；库存足够时直接结束。每次委派"
-            "的 task 使用 JSON，携带相关既有结构化结果、analysis_strategy、replan_reason 和"
-            "replan_start。会话修改时只重跑受影响的分析并复用其他有效结果。\n"
+            "空上下文；修改会话时携带最新用户修改文本。"
+            "禁止按预设固定流水线机械调用。先判断已有证据和缺失字段；库存足够时直接结束。"
+            "业务依赖必须严格遵守：requirement 无上游；inventory 依赖 requirement；supplier 依赖"
+            "requirement+inventory；pricing 依赖 requirement+inventory+supplier；budget 依赖"
+            "requirement+pricing；risk 依赖 requirement+supplier+pricing+budget；execution 依赖"
+            "requirement+risk+budget。不得在上游正式结果返回前调用下游；互不依赖且依赖均满足的"
+            "任务可并行。同一次模型响应中不得同时安排有前后依赖的 SubAgent，必须等上游结果写入"
+            "State 后在下一轮再安排下游。每次委派的 task 只携带相关结构化 State、analysis_strategy、"
+            "replan_reason 和 replan_start。会话修改时只重跑受影响的分析并复用其他有效结果。\n"
             "反思策略：数据库结构或查询失败时以 schema_recovery 重试受影响 Agent；SubAgent 数据"
             "不足时使用 fallback_recovery 并缩小查询目标；全部超预算时让 Pricing Agent 使用"
             "cost_reduction，生成谈判目标或预算内分阶段备选，再重跑 Budget/Risk；交期不满足时先"
@@ -343,8 +351,8 @@ async def create_procurement_app_async(
             "risk_diversification。一次重规划只在首个调整调用设置 replan_start=true。若新策略仍"
             "违反硬约束，明确阻断执行并请求用户调整，不得伪造可行性。\n"
             "形成可行方案后，把 request、recommended_plan、budget_analysis 交给 Execution Agent。"
-            "使用结构化采购 Context 中的目标、已确认事实、结论、当前方案、budget_gap、风险、"
-            "约束和 evidence/source_ref；最新用户修改使相关旧结论失效，必须重新验证。"
+            "所有下游业务数据只读取应用层注入的已确认结构化 State，不得根据 facts、conclusion"
+            "或其他摘要重建数量、金额与方案；最新用户修改使相关旧结果失效，必须重新验证。"
             "超预算时基于 budget_gap 与当前方案加载 cost-optimization，再委派 Pricing "
             "以 cost_reduction 重规划；交期失败使用 delivery-recovery，供应商风险使用 "
             "supplier-risk-review，紧急需求使用 urgent-procurement。先 load_skill 再应用策略。"
@@ -367,6 +375,7 @@ async def create_procurement_app_async(
         checkpointer=checkpointer,
         event_sinks=sinks,
     )
+
     return ProcurementApplication(
         agent=main,
         database=database,

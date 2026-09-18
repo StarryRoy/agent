@@ -6,7 +6,12 @@ from pathlib import Path
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
+from procurement_agent.business_validation import (
+    BusinessConsistencyError,
+    validate_business_result,
+)
 from procurement_agent.models import build_mock_execute_query_tool
+from procurement_agent.schemas import SUBAGENT_OUTPUT_TYPES
 from procurement_agent.services import ProcurementServices
 from procurement_agent.test_runtime import ProcurementTestConfig, use_test_config
 from procurement_agent.tool_contracts import (
@@ -76,6 +81,30 @@ def test_every_business_tool_uses_its_explicit_pydantic_contract():
         for field in args_schema.model_fields.values():
             assert field.is_required()
             assert field.description
+
+
+def test_each_subagent_has_a_strict_role_specific_output_schema():
+    schemas = {
+        name: TypeAdapter(output_type).json_schema()
+        for name, output_type in SUBAGENT_OUTPUT_TYPES.items()
+    }
+    assert set(schemas) == {
+        "requirement_agent",
+        "inventory_agent",
+        "supplier_agent",
+        "pricing_agent",
+        "budget_agent",
+        "risk_agent",
+        "execution_agent",
+    }
+    for schema in schemas.values():
+        serialized = json.dumps(schema)
+        assert '"remarks"' in serialized
+        assert '"additionalProperties": false' in serialized
+        assert '"source_ref"' not in serialized
+    assert "recommended_purchase_quantity" in json.dumps(schemas["inventory_agent"])
+    assert "candidate_suppliers" in json.dumps(schemas["supplier_agent"])
+    assert "estimated_occupation" in json.dumps(schemas["budget_agent"])
 
 
 def test_missing_required_tool_fields_fail_before_business_logic_runs():
@@ -195,6 +224,152 @@ def test_all_analysis_tool_outputs_satisfy_their_declared_models():
         execution = tools["execute_procurement_plan"].invoke(execution_arguments)
     assert execution["status"] == "failed"
     assert execution["error"]["type"] == "scripted_execution_failure"
+
+
+def test_complete_chain_passes_deterministic_business_consistency_validation():
+    tools = _tools(SuccessfulWriteDatabase())
+    fixtures = _fixtures()
+    requirement = tools["parse_requirement"].invoke(
+        {"text": "下个月采购500台设备，预算80万。", "previous_request": None}
+    )
+    state = {"requirement": validate_business_result("requirement_agent", requirement, {})}
+    request = requirement["request"]
+    common = {"analysis_strategy": "standard", "replan_reason": None}
+    inventory = tools["calculate_inventory"].invoke(
+        {"request": request, "query_result": _query(fixtures["inventory"]["1"]), **common}
+    )
+    state["inventory_analysis"] = validate_business_result("inventory_agent", inventory, state)
+    suppliers = tools["calculate_suppliers"].invoke(
+        {
+            "request": request,
+            "inventory_analysis": inventory,
+            "query_result": _query(fixtures["supplier"]["1"]),
+            **common,
+        }
+    )
+    state["supplier_analysis"] = validate_business_result("supplier_agent", suppliers, state)
+    pricing = tools["calculate_pricing"].invoke(
+        {
+            "request": request,
+            "inventory_analysis": inventory,
+            "supplier_analysis": suppliers,
+            "query_result": _query(fixtures["pricing"]["1"]),
+            **common,
+        }
+    )
+    state["pricing_analysis"] = validate_business_result("pricing_agent", pricing, state)
+    budget = tools["calculate_budget"].invoke(
+        {
+            "request": request,
+            "pricing_analysis": pricing,
+            "query_result": _query(fixtures["budget"]["IT"]),
+            **common,
+        }
+    )
+    state["budget_analysis"] = validate_business_result("budget_agent", budget, state)
+    risk = tools["calculate_risk"].invoke(
+        {
+            "request": request,
+            "supplier_analysis": suppliers,
+            "pricing_analysis": pricing,
+            "budget_analysis": budget,
+            "query_result": _query(fixtures["risk"]["1"]),
+            **common,
+        }
+    )
+    state["risk_analysis"] = validate_business_result("risk_agent", risk, state)
+    drifted_risk = copy.deepcopy(risk)
+    drifted_risk["recommended_plan"]["quantity"] = 500
+    with pytest.raises(BusinessConsistencyError, match="分配数量"):
+        validate_business_result("risk_agent", drifted_risk, state)
+    execution = tools["execute_procurement_plan"].invoke(
+        {
+            "request": request,
+            "recommended_plan": risk["recommended_plan"],
+            "budget_analysis": budget,
+            "session_id": "contract-test",
+        }
+    )
+    state["execution"] = validate_business_result("execution_agent", execution, state)
+    drifted_execution = {**execution, "budget_reserved": 1}
+    with pytest.raises(BusinessConsistencyError, match="执行预算占用"):
+        validate_business_result("execution_agent", drifted_execution, state)
+
+    assert state["inventory_analysis"]["recommended_purchase_quantity"] == 445
+    assert state["risk_analysis"]["recommended_plan"]["quantity"] == 445
+    assert state["execution"]["budget_reserved"] == risk["recommended_plan"]["total_cost"]
+
+
+@pytest.mark.parametrize(
+    ("agent_name", "mutate", "message"),
+    [
+        (
+            "inventory_agent",
+            lambda value: value.update(recommended_purchase_quantity=500),
+            "建议采购数量",
+        ),
+        (
+            "pricing_agent",
+            lambda value: value["plans"][0]["allocations"][0].update(quantity=500),
+            "分配数量",
+        ),
+        (
+            "budget_agent",
+            lambda value: value.update(estimated_occupation=1),
+            "预算预计占用",
+        ),
+    ],
+)
+def test_consistency_validation_rejects_cross_stage_drift(agent_name, mutate, message):
+    tools = _tools()
+    fixtures = _fixtures()
+    requirement = tools["parse_requirement"].invoke(
+        {"text": "下个月采购500台设备，预算80万。", "previous_request": None}
+    )
+    request = requirement["request"]
+    common = {"analysis_strategy": "standard", "replan_reason": None}
+    inventory = tools["calculate_inventory"].invoke(
+        {"request": request, "query_result": _query(fixtures["inventory"]["1"]), **common}
+    )
+    suppliers = tools["calculate_suppliers"].invoke(
+        {
+            "request": request,
+            "inventory_analysis": inventory,
+            "query_result": _query(fixtures["supplier"]["1"]),
+            **common,
+        }
+    )
+    pricing = tools["calculate_pricing"].invoke(
+        {
+            "request": request,
+            "inventory_analysis": inventory,
+            "supplier_analysis": suppliers,
+            "query_result": _query(fixtures["pricing"]["1"]),
+            **common,
+        }
+    )
+    budget = tools["calculate_budget"].invoke(
+        {
+            "request": request,
+            "pricing_analysis": pricing,
+            "query_result": _query(fixtures["budget"]["IT"]),
+            **common,
+        }
+    )
+    state = {
+        "requirement": requirement,
+        "inventory_analysis": inventory,
+        "supplier_analysis": suppliers,
+        "pricing_analysis": pricing,
+    }
+    values = {
+        "inventory_agent": copy.deepcopy(inventory),
+        "pricing_agent": copy.deepcopy(pricing),
+        "budget_agent": copy.deepcopy(budget),
+    }
+    mutate(values[agent_name])
+    with pytest.raises(BusinessConsistencyError, match=message):
+        validate_business_result(agent_name, values[agent_name], state)
 
 
 def test_normal_business_request_has_no_simulation_fields_and_completes_analysis():

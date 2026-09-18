@@ -8,11 +8,9 @@ from dataclasses import dataclass, field
 from typing import Any, Self
 
 from agent_harness import Agent, AgentResult, DatabaseToolkit, StreamEvent
-from langchain_core.messages import ToolMessage
 from pydantic import BaseModel
 
 from .metrics import ProcurementMetricSink
-from .models import SUBAGENT_TO_FIELD, _tool_value
 
 
 def _plain(value: Any) -> Any:
@@ -184,13 +182,21 @@ class ProcurementApplication:
 
     @staticmethod
     def _proposal_from_state(state: Mapping[str, Any]) -> dict[str, Any]:
-        values: dict[str, dict[str, Any]] = {}
-        for message in state.get("messages", []):
-            if not isinstance(message, ToolMessage) or message.name not in SUBAGENT_TO_FIELD:
-                continue
-            parsed = _tool_value(message)
-            if isinstance(parsed, dict):
-                values[SUBAGENT_TO_FIELD[message.name]] = parsed
+        business_state = state.get("procurement_results")
+        business_state = business_state if isinstance(business_state, Mapping) else {}
+        values = {
+            field: value
+            for field in (
+                "requirement",
+                "inventory_analysis",
+                "supplier_analysis",
+                "pricing_analysis",
+                "budget_analysis",
+                "risk_analysis",
+                "execution",
+            )
+            if isinstance((value := business_state.get(field)), Mapping)
+        }
         requirement = values.get("requirement", {})
         supplier = values.get("supplier_analysis", {})
         risk = values.get("risk_analysis", {})
