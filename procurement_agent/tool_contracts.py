@@ -108,8 +108,10 @@ class SupplierRow(ContractModel):
     supplier_id: PositiveInt = Field(..., description="供应商 ID。")
     code: NonEmpty = Field(..., description="供应商编码。")
     name: NonEmpty = Field(..., description="供应商名称。")
-    status: NonEmpty = Field(..., description="供应商状态。")
-    cooperation_status: NonEmpty = Field(..., description="合作状态。")
+    status: Literal["active", "suspended"] = Field(..., description="供应商启停状态。")
+    cooperation_status: Literal["strategic", "approved", "probation", "blocked"] = Field(
+        ..., description="供应商合作状态。"
+    )
     risk_level: Literal["low", "medium", "high", "critical"] = Field(..., description="风险等级。")
     min_order_qty: PositiveInt = Field(..., description="最小起订量。")
     max_capacity: NonNegativeInt = Field(..., description="最大供货能力。")
@@ -184,12 +186,142 @@ class RiskQuerySuccess(QuerySuccessBase):
     rows: list[RiskRow] = Field(..., description="供应商风险记录行。")
 
 
-class Evidence(ContractModel):
-    source: Literal["DatabaseToolkit.execute_query"] = Field(..., description="证据来源。")
-    operation: Literal["execute_query"] = Field(..., description="数据库操作。")
-    row_count: NonNegativeInt = Field(..., description="证据行数。")
-    truncated: bool = Field(..., description="证据是否截断。")
-    subtask: NonEmpty = Field(..., description="证据对应子任务。")
+DatabaseEvidenceSubtask = Literal[
+    "inventory_and_consumption",
+    "inventory_analysis",
+    "supplier_capability_and_history",
+    "current_and_historical_prices",
+    "pricing_analysis",
+    "department_budget",
+    "supplier_risk_records",
+]
+
+
+class RowCountEvidence(ContractModel):
+    row_count: NonNegativeInt = Field(..., description="证据覆盖的业务记录数。")
+    truncated: bool = Field(..., description="证据是否因行数限制被截断。")
+
+
+class DatabaseQueryEvidence(RowCountEvidence):
+    source: Literal["DatabaseToolkit.execute_query"] = Field(
+        ..., description="数据库查询证据来源。"
+    )
+    operation: Literal["execute_query"] = Field(..., description="数据库查询操作。")
+    subtask: DatabaseEvidenceSubtask = Field(..., description="数据库查询对应的业务子任务。")
+
+
+class InventoryEvidenceValues(ContractModel):
+    product_id: PositiveInt = Field(..., description="产品 ID。")
+    sku: NonEmpty = Field(..., description="产品 SKU。")
+    name: NonEmpty = Field(..., description="产品名称。")
+    current_qty: NonNegativeInt = Field(..., description="当前库存。")
+    locked_qty: NonNegativeInt = Field(..., description="锁定库存。")
+    in_transit_qty: NonNegativeInt = Field(..., description="在途数量。")
+    safety_stock: NonNegativeInt = Field(..., description="安全库存。")
+    updated_at: NonEmpty = Field(..., description="库存更新时间。")
+    average_monthly_consumption: NonNegativeFloat = Field(..., description="月均消耗。")
+
+
+class InventoryDatabaseDetailEvidence(DatabaseQueryEvidence):
+    subtask: Literal["inventory_and_consumption", "inventory_analysis"] = Field(
+        ..., description="库存查询子任务。"
+    )
+    fields: list[
+        Literal[
+            "product_id",
+            "sku",
+            "name",
+            "current_qty",
+            "locked_qty",
+            "in_transit_qty",
+            "safety_stock",
+            "updated_at",
+            "average_monthly_consumption",
+        ]
+    ] = Field(..., min_length=1, description="被引用的库存字段。")
+    values: InventoryEvidenceValues = Field(..., description="库存查询证据值。")
+
+
+class InventoryCalculatorEvidence(RowCountEvidence):
+    source: Literal["calculate_inventory"] = Field(..., description="库存计算器证据来源。")
+    operation: Literal["calculate_inventory"] = Field(..., description="库存计算操作。")
+    subtask: Literal["inventory_analysis"] = Field(..., description="库存分析子任务。")
+
+
+class SupplierCalculatorEvidence(RowCountEvidence):
+    source: Literal["calculate_suppliers"] = Field(..., description="供应商计算器证据来源。")
+    operation: Literal["calculate_suppliers"] = Field(..., description="供应商筛选操作。")
+    subtask: Literal["supplier_analysis"] = Field(..., description="供应商分析子任务。")
+
+
+class PricingCalculatorEvidence(RowCountEvidence):
+    source: Literal["calculate_pricing"] = Field(..., description="价格计算器证据来源。")
+    operation: Literal["calculate_pricing"] = Field(..., description="价格方案计算操作。")
+    subtask: Literal["pricing_analysis"] = Field(..., description="价格分析子任务。")
+
+
+class BudgetCalculatorEvidence(RowCountEvidence):
+    source: Literal["calculate_budget"] = Field(..., description="预算计算器证据来源。")
+    operation: Literal["calculate_budget"] = Field(..., description="预算核验操作。")
+    subtask: Literal["budget_analysis"] = Field(..., description="预算分析子任务。")
+
+
+class DetailedBudgetCalculatorEvidence(BudgetCalculatorEvidence):
+    budget_total: NonNegativeFloat = Field(..., description="预算总额。")
+    used_budget: NonNegativeFloat = Field(..., description="已使用预算。")
+    approved_not_executed: NonNegativeFloat = Field(..., description="已批未执行金额。")
+    available_budget: NonNegativeFloat = Field(..., description="部门可用预算。")
+    user_budget: float | None = Field(..., ge=0, description="用户预算上限。")
+    effective_available_budget: NonNegativeFloat = Field(..., description="有效可用预算。")
+    estimated_occupation: NonNegativeFloat = Field(..., description="预计预算占用。")
+    within_budget: bool = Field(..., description="方案是否在预算内。")
+    over_budget_amount: NonNegativeFloat = Field(..., description="超预算金额。")
+    adjustment_room: NonNegativeFloat = Field(..., description="预算调整余量。")
+    budget_risk: Literal["low", "medium", "high"] = Field(..., description="预算风险。")
+    conclusion: NonEmpty = Field(..., description="预算核验结论。")
+
+
+class RiskCalculatorEvidence(RowCountEvidence):
+    source: Literal["calculate_risk"] = Field(..., description="风险计算器证据来源。")
+    operation: Literal["calculate_risk"] = Field(..., description="风险评估操作。")
+    subtask: Literal["risk_analysis"] = Field(..., description="风险分析子任务。")
+
+
+SupplierOperationalStatus = Literal[
+    "operational", "capacity_warning", "suspended", "blocked", "unknown"
+]
+
+
+class ExternalSupplierStatusEvidence(ContractModel):
+    source: Literal["external_supplier_status_mcp"] = Field(..., description="供应商状态 MCP。")
+    operation: Literal["supplier_status"] = Field(..., description="供应商实时状态查询操作。")
+    subtask: Literal["external_status_check"] = Field(..., description="外部状态检查子任务。")
+    suppliers_checked: list[NonEmpty] = Field(
+        ..., min_length=1, description="已查询实时状态的供应商编码。"
+    )
+    statuses: dict[str, SupplierOperationalStatus] = Field(
+        ..., min_length=1, description="供应商编码到实时状态的映射。"
+    )
+
+
+class ExternalSupplierStatusSummaryEvidence(RowCountEvidence):
+    source: Literal["external_supplier_status_mcp"] = Field(..., description="供应商状态 MCP。")
+    operation: Literal["supplier_status"] = Field(..., description="供应商实时状态查询操作。")
+    subtask: Literal["external_status_check"] = Field(..., description="外部状态检查子任务。")
+
+
+Evidence = (
+    InventoryDatabaseDetailEvidence
+    | DatabaseQueryEvidence
+    | InventoryCalculatorEvidence
+    | SupplierCalculatorEvidence
+    | PricingCalculatorEvidence
+    | DetailedBudgetCalculatorEvidence
+    | BudgetCalculatorEvidence
+    | RiskCalculatorEvidence
+    | ExternalSupplierStatusEvidence
+    | ExternalSupplierStatusSummaryEvidence
+)
 
 
 class ParseRequirementArgs(ContractModel):
@@ -230,19 +362,31 @@ class InventoryAnalysis(ContractModel):
     fallback_basis: str | None = Field(..., description="降级估算依据。")
 
 
-class SupplierCandidate(SupplierRow):
+class SupplierAssessment(SupplierRow):
     can_fulfill_alone: bool = Field(..., description="能否独立满足数量。")
     meets_deadline: bool = Field(..., description="是否满足交期。")
-    selection_reasons: list[str] = Field(..., description="候选依据。")
-    rejection_reasons: list[str] | None = Field(None, description="排除依据。")
-    external_status: str | None = Field(None, description="外部实时状态。")
+    external_status: SupplierOperationalStatus | None = Field(None, description="外部实时状态。")
+
+
+class SupplierCandidate(SupplierAssessment):
+    selection_reasons: list[NonEmpty] = Field(..., min_length=1, description="入选候选的依据。")
+
+
+class RejectedSupplier(SupplierAssessment):
+    rejection_reasons: list[NonEmpty] = Field(..., min_length=1, description="供应商被排除的依据。")
+    selection_reasons: list[NonEmpty] | None = Field(
+        None,
+        max_length=0,
+        exclude=True,
+        description="兼容真实历史数据中的空候选依据；被拒供应商不得包含非空候选依据。",
+    )
 
 
 class SupplierAnalysis(ContractModel):
     subtask: Literal["supplier_analysis"] = Field(..., description="子任务名称。")
     evidence: list[Evidence] = Field(..., min_length=1, description="查询证据。")
     candidate_suppliers: list[SupplierCandidate] = Field(..., description="候选供应商。")
-    rejected_suppliers: list[SupplierCandidate] = Field(..., description="被排除供应商。")
+    rejected_suppliers: list[RejectedSupplier] = Field(..., description="被排除供应商。")
     required_quantity: NonNegativeInt = Field(..., description="所需采购数量。")
     delivery_window_days: int | None = Field(..., ge=0, description="可用交付窗口。")
     facts: list[str] = Field(..., description="供应商事实。")
@@ -250,7 +394,9 @@ class SupplierAnalysis(ContractModel):
     status: Literal["success", "error"] = Field(..., description="分析状态。")
     analysis_strategy: AnalysisStrategy = Field(..., description="分析策略。")
     replan_reason: str | None = Field(..., description="重规划原因。")
-    external_status: dict[str, str] = Field(..., description="供应商实时状态映射。")
+    external_status: dict[str, SupplierOperationalStatus] = Field(
+        ..., description="供应商编码到实时状态的映射。"
+    )
     mcp_status: Literal["not_checked", "success", "fallback"] = Field(
         ..., description="实时状态检查状态。"
     )

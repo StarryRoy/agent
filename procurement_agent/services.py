@@ -375,7 +375,7 @@ class ProcurementServices:
             item = dict(row)
             item["can_fulfill_alone"] = int(row["max_capacity"]) >= qty
             item["meets_deadline"] = days is None or int(row["lead_time_days"]) <= days
-            item["selection_reasons"] = [
+            selection_reasons = [
                 f"最大供应能力{row['max_capacity']}",
                 f"交付周期{row['lead_time_days']}天",
                 f"历史准时率{float(row['on_time_rate']):.1%}",
@@ -387,6 +387,7 @@ class ProcurementServices:
                 item["rejection_reasons"] = reasons
                 rejected.append(item)
             else:
+                item["selection_reasons"] = selection_reasons
                 candidates.append(item)
         if strategy == "delivery_first":
             candidates.sort(key=lambda item: (not item["meets_deadline"], item["lead_time_days"]))
