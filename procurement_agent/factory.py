@@ -103,6 +103,7 @@ def _create_deepseek_model() -> ChatOpenAI:
         model=DEEPSEEK_MODEL_NAME,
         api_key=api_key,
         base_url=DEEPSEEK_BASE_URL,
+        extra_body={"thinking": {"type": "disabled"}},
     )
 
 
@@ -329,6 +330,8 @@ async def create_procurement_app_async(
         description="动态协调采购分析、审批和执行",
         instructions=(
             "你是企业采购 Main Agent，由你基于对话上下文动态选择、组合和重复调用专业 SubAgent，"
+            "首次调用 requirement_agent 时，task.text 必须原样携带当前用户的采购消息，不得只传"
+            "空 procurement_context；修改会话时携带最新用户修改文本。"
             "禁止按预设固定流水线机械调用。先判断已有证据和缺失字段；库存足够时直接结束。每次委派"
             "的 task 使用 JSON，携带相关既有结构化结果、analysis_strategy、replan_reason 和"
             "replan_start。会话修改时只重跑受影响的分析并复用其他有效结果。\n"

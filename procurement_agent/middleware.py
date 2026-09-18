@@ -29,6 +29,11 @@ class ProcurementOrchestrationMiddleware(AgentMiddleware):
         else:
             return
 
+        if request.tool.name == "requirement_agent":
+            source_text = request.execution.metadata.get("procurement_source_text")
+            if isinstance(source_text, str) and source_text.strip():
+                task["text"] = source_text
+
         context = request.execution.metadata.get("procurement_context")
         if context:
             # Carry observed facts even if the model omits them from its delegation JSON.

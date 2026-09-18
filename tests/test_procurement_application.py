@@ -345,6 +345,7 @@ def test_production_factory_creates_one_deepseek_for_all_agents(tmp_path, monkey
                 "model": factory_module.DEEPSEEK_MODEL_NAME,
                 "api_key": "test-deepseek-key",
                 "base_url": factory_module.DEEPSEEK_BASE_URL,
+                "extra_body": {"thinking": {"type": "disabled"}},
             }
         ]
         assert application.agent.definition.model is default_model

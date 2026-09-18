@@ -9,6 +9,9 @@ Harness 原生 HITL 在持久化 Checkpoint 上暂停和恢复。
 `glm-4.7-flash`；DeepSeek 使用官方 OpenAI 兼容接口和当前 Flash 编码 `deepseek-flash`。
 API Key 只从系统环境变量 `GEMINI_API_KEY`、`GLM_API_KEY` 或 `DEEPSEEK_API_KEY` 读取，不写入
 代码或配置文件。默认提供商为 GLM；可用 `PROCUREMENT_MODEL_PROVIDER=gemini|deepseek` 切换。
+DeepSeek 显式发送 `thinking.type=disabled`，避免多轮 Tool Call 因历史 `reasoning_content` 未回传
+而被接口拒绝。Main Agent 委派 Requirement Agent 时会强制补入最新用户原始消息，防止空
+`procurement_context` 造成需求字段丢失。
 Main Agent 根据会话证据动态选择和协调 SubAgent；显式传入的 `model` 或 `role_models` 仍可
 覆盖默认模型，项目不会在未配置 Key 时隐式退回 Python 规则。SubAgent 单次运行超时为 60 秒，
 Main Agent 为 90 秒。

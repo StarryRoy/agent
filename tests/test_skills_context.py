@@ -2,14 +2,16 @@
 
 import json
 from datetime import date
+from types import SimpleNamespace
 
 import pytest
-from agent_harness import ModelRequest
+from agent_harness import ModelRequest, ToolRequest
 from agent_harness.middleware import AgentExecution
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from procurement_agent import create_procurement_app
 from procurement_agent.context import ProcurementContextMiddleware, task_view
+from procurement_agent.middleware import ProcurementOrchestrationMiddleware
 
 
 def test_each_query_subagent_loads_only_its_domain_skill(tmp_path):
@@ -130,3 +132,32 @@ def test_format_request_ends_with_user_message_for_gemini_structured_output():
 
     assert isinstance(request.messages[-1], HumanMessage)
     assert request.messages[-2] == messages[-1]
+
+
+def test_requirement_delegation_recovers_original_user_text_from_parent_execution():
+    source_text = "下个月采购500台设备，预算80万，月底前到货。"
+    execution = AgentExecution("main", {}, session_id="requirement-source")
+    model_request = ModelRequest(
+        execution,
+        {"messages": [HumanMessage(content=source_text)]},
+        [HumanMessage(content=source_text)],
+        {},
+    )
+    ProcurementContextMiddleware().before_model(model_request)
+    tool_request = ToolRequest(
+        execution,
+        SimpleNamespace(name="requirement_agent"),
+        {
+            "task": json.dumps(
+                {"text": "模型改写后的不完整文本", "procurement_context": {}},
+                ensure_ascii=False,
+            )
+        },
+        {},
+        "requirement-call",
+    )
+
+    ProcurementOrchestrationMiddleware._prepare(tool_request)
+
+    task = json.loads(tool_request.arguments["task"])
+    assert task["text"] == source_text

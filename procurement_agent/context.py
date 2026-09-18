@@ -120,6 +120,20 @@ def task_view(name: str, task: dict) -> dict:
 
 class ProcurementContextMiddleware(AgentMiddleware):
     def before_model(self, request: ModelRequest) -> None:
+        # Keep the latest original user turn available to the parent tool-call
+        # middleware. Real models can otherwise delegate an empty context to the
+        # requirement agent and lose the source procurement request entirely.
+        for item in reversed(request.messages):
+            if not isinstance(item, HumanMessage):
+                continue
+            value = decode(item.content)
+            source_text = value if isinstance(value, str) else None
+            if isinstance(value, dict) and isinstance(value.get("text"), str):
+                source_text = value["text"]
+            if source_text and source_text.strip():
+                request.execution.metadata["procurement_source_text"] = source_text
+            break
+
         messages = []
         results = {}
         # Preserve call/response pairs and counters, but omit replaced results within a turn.
