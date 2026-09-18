@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from agent_harness import AgentMiddleware, ModelRequest
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
 from .business_validation import FIELD_BY_AGENT
 
@@ -57,28 +57,60 @@ def business_view(value: Any) -> Any:
 
 FIELDS = FIELD_BY_AGENT
 
-# Only pass each Tool's actual dependencies, preserving exact plans and constraints.
+# Only pass each SubAgent's actual upstream business State.  Internal tool
+# arguments are deliberately not part of this projection; the child agent owns
+# those decisions.
 DEPENDENCIES = {
-    "requirement_agent": {"text", "previous_request"},
-    "inventory_agent": {"request"},
-    "supplier_agent": {"request", "inventory_analysis"},
-    "pricing_agent": {"request", "inventory_analysis", "supplier_analysis"},
-    "budget_agent": {"request", "pricing_analysis"},
-    "risk_agent": {"request", "supplier_analysis", "pricing_analysis", "budget_analysis"},
-    "execution_agent": {"request", "recommended_plan", "budget_analysis", "session_id"},
+    "requirement_agent": {"requirement"},
+    "inventory_agent": {"requirement"},
+    "supplier_agent": {"requirement", "inventory_analysis"},
+    "pricing_agent": {"requirement", "inventory_analysis", "supplier_analysis"},
+    "budget_agent": {"requirement", "pricing_analysis"},
+    "risk_agent": {
+        "requirement",
+        "supplier_analysis",
+        "pricing_analysis",
+        "budget_analysis",
+    },
+    "execution_agent": {"requirement", "risk_analysis", "budget_analysis"},
 }
 
 
 def task_view(name: str, task: dict) -> dict:
+    """Normalize a delegation into the public Main -> SubAgent boundary.
+
+    This function only projects formal upstream State.  It does not project or
+    synthesize any calculator/tool arguments, strategies, retries, or skills.
+    """
+
     task = business_view(task)
     if name not in DEPENDENCIES:
         return task
-    allowed = DEPENDENCIES[name] | {
-        "analysis_strategy",
-        "replan_reason",
-        "replan_start",
-    }
-    return {key: value for key, value in task.items() if key in allowed}
+
+    raw_state = task.get("upstream_state")
+    if isinstance(raw_state, Mapping):
+        upstream = {
+            key: value
+            for key, value in raw_state.items()
+            if key in DEPENDENCIES[name]
+        }
+    else:
+        # Accept the legacy flat form at the boundary, but immediately turn it
+        # into the same goal + State envelope used by new callers.
+        upstream = {
+            key: task[key]
+            for key in DEPENDENCIES[name]
+            if key in task
+        }
+
+    goal = task.get("goal")
+    if goal is None:
+        goal = task.get("text")
+    prepared = {"goal": goal, "upstream_state": upstream}
+    if "session_id" in task:
+        # This is execution plumbing, not a business decision or tool input.
+        prepared["session_id"] = task["session_id"]
+    return prepared
 
 
 class ProcurementContextMiddleware(AgentMiddleware):
@@ -138,19 +170,6 @@ class ProcurementContextMiddleware(AgentMiddleware):
                     item = item.model_copy(
                         update={"content": json.dumps(value, ensure_ascii=False)}
                     )
-            elif isinstance(item, AIMessage) and item.tool_calls:
-                calls = []
-                for call in item.tool_calls:
-                    args = dict(call["args"])
-                    for key in ("task", "plan_json"):
-                        if key in args:
-                            task = decode(args[key])
-                            args[key] = json.dumps(
-                                task_view(call["name"], task) if isinstance(task, dict) else task,
-                                ensure_ascii=False,
-                            )
-                    calls.append({**call, "args": args})
-                item = item.model_copy(update={"tool_calls": calls})
             elif isinstance(item, HumanMessage):
                 value = decode(item.content)
                 if isinstance(value, dict):

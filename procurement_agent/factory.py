@@ -12,7 +12,6 @@ from typing import Any
 
 from agent_harness import (
     ContextPolicy,
-    LexicalSkillSelector,
     ObservabilityConfig,
     RuntimeConfig,
     SkillLoader,
@@ -29,12 +28,11 @@ from .application import ProcurementApplication
 from .context import ProcurementContextMiddleware
 from .database import ProcurementSQLiteBackend, initialize_database
 from .metrics import JsonLinesEventSink, ObservedDatabaseToolkit, ProcurementMetricSink
-from .middleware import ProcurementBusinessToolMiddleware, ProcurementOrchestrationMiddleware
+from .middleware import ProcurementOrchestrationMiddleware
 from .models import DeterministicProcurementModel, build_mock_execute_query_tool
 from .persistence import PersistentSQLiteSaver
 from .schemas import SUBAGENT_OUTPUT_TYPES, ProcurementDecision, ProcurementState
 from .services import ProcurementServices
-from .skill_policy import ProcurementSkillMiddleware
 from .sql_catalog import role_database_context
 
 _MCP_TOOL_CACHE: list[Any] | None = None
@@ -140,33 +138,24 @@ async def _supplier_mcp_tools() -> list[Any]:
 
 def _instructions(role: str, business_today: date) -> str:
     common = (
-        "你是企业采购应用的专业 SubAgent。只处理分配给你的领域，使用工具获取事实，"
-        "严格按本角色独立输出 Schema 返回 JSON，不编造数据库结果。核心字段必须完整，场景外"
-        "补充信息只写入 remarks。原样保留计算 Tool 已确认的数量、金额、方案及 evidence，"
-        "不得通过 facts/conclusion 摘要重建或改写；最终结果不返回 SQL 或原始 MCP 包装。"
-        "若本角色提供 Skill，必须先加载并遵循。查询角色先根据 Skill、Schema 和 Metadata 动态生成 SQL，"
-        "直接调用 Harness execute_query；返回 ok=false 时把 Harness error 作为反馈，修正 SQL 后"
-        "重试，成功且字段契约完整后才调用确定性计算 Tool。不得让计算 Tool 生成或执行 SQL。"
+        "你是企业采购应用的专业 SubAgent，只处理分配给你的领域。你收到的是业务目标和"
+        "应用层确认的上游结构化 State；在这个黑盒边界内自主决定是否加载 Skill、调用哪些"
+        "Tool、如何组织分析和是否重试。依据 Tool Schema、可用 Skill、Schema/Metadata 和"
+        "Tool 返回结果工作，不等待 Main 指定内部步骤或参数。严格按本角色 Schema 返回 JSON，"
+        "不编造事实；核心字段必须完整，场景外补充信息只写入 remarks。原样保留 Tool 已确认的"
+        "数量、金额、方案及 evidence，不通过 facts/conclusion 摘要重建或改写；最终结果不返回"
+        "SQL 或原始 MCP 包装。查询错误、数据不足或外部服务错误时，自主选择安全的修正/降级"
+        "路径，并在结构化结果中保留证据和状态。"
         f"当前业务日期为 {business_today.isoformat()}。"
     )
     details = {
         "requirement": "提取产品、数量、预算、交期、质量、优先级和供应商约束；缺失字段必须明确。",
-        "inventory": (
-            "查询后调用 calculate_inventory 计算可用、在途、安全库存、预测消耗和采购缺口。"
-            "analysis_strategy 支持 standard、schema_recovery、fallback_recovery。"
-        ),
-        "supplier": (
-            "查询后调用 calculate_suppliers 筛选能力、MOQ、交期、合作状态和历史表现，并核验外部实时状态。"
-            "重规划时按 analysis_strategy 使用 delivery_first、risk_first 或 fallback_recovery。"
-        ),
-        "pricing": (
-            "查询后调用 calculate_pricing 比较当前与历史价格，计算单一及组合方案。"
-            "重规划时按 analysis_strategy 使用 cost_reduction、delivery_recovery 或"
-            "risk_diversification，明确条件性方案。"
-        ),
-        "budget": "查询后调用 calculate_budget 核验部门余额、用户上限和方案预计占用。",
-        "risk": "查询后调用 calculate_risk 评估履约、交付、质量、预算、集中度和规模风险。",
-        "execution": "只执行 Main Agent 已确认的采购方案，不重新决策。所有写操作使用专用工具。",
+        "inventory": "完成库存、在途、预测消耗、安全库存和采购缺口分析。",
+        "supplier": "筛选供应商能力、MOQ、交期、合作状态和历史表现，并核验可用的实时状态。",
+        "pricing": "比较当前与历史价格，形成满足数量、交期和其他硬约束的候选方案。",
+        "budget": "核验部门余额、用户预算上限和候选方案预计占用。",
+        "risk": "评估履约、交付、质量、预算、集中度和规模风险，确认可行方案。",
+        "execution": "执行已由 Main Agent 交付且通过应用层校验的采购方案，不重新决策。",
     }
     database_context = role_database_context(role)
     return f"{common}{details[role]}" + (f"\n\n{database_context}" if database_context else "")
@@ -272,24 +261,25 @@ async def create_procurement_app_async(
     }
     skill_root = Path(__file__).with_name("skills")
     skills = [SkillLoader().load(path) for path in sorted(skill_root.iterdir()) if path.is_dir()]
-    selector = LexicalSkillSelector()
     role_skills = {
-        "requirement": set(),
-        "inventory": {"inventory-analysis"},
-        "supplier": {"supplier-analysis"},
-        "pricing": {"pricing-analysis"},
-        "budget": {"budget-analysis"},
-        "risk": {"risk-analysis"},
+        "requirement": {"urgent-procurement"},
+        "inventory": {"inventory-analysis", "urgent-procurement"},
+        "supplier": {
+            "supplier-analysis",
+            "delivery-recovery",
+            "supplier-risk-review",
+            "urgent-procurement",
+        },
+        "pricing": {
+            "pricing-analysis",
+            "cost-optimization",
+            "delivery-recovery",
+            "urgent-procurement",
+        },
+        "budget": {"budget-analysis", "urgent-procurement"},
+        "risk": {"risk-analysis", "supplier-risk-review", "urgent-procurement"},
         "execution": set(),
     }
-    main_skill_names = {
-        "cost-optimization",
-        "delivery-recovery",
-        "supplier-risk-review",
-        "urgent-procurement",
-    }
-    main_skills = [skill for skill in skills if skill.name in main_skill_names]
-
     def model_for(role: str) -> BaseChatModel | str | None:
         if deterministic:
             return DeterministicProcurementModel(role=role)
@@ -314,12 +304,9 @@ async def create_procurement_app_async(
                 instructions=_instructions(role, business_today),
                 model=model_for(role),
                 skills=selected_skills,
-                skill_selector=selector,
                 response_format=TypeAdapter(SUBAGENT_OUTPUT_TYPES[f"{role}_agent"]).json_schema(),
                 middleware=[
                     ProcurementContextMiddleware(),
-                    ProcurementSkillMiddleware(role, selected_skills, selector),
-                    ProcurementBusinessToolMiddleware(),
                 ],
                 tools=role_tools,
                 runtime_config=sub_config,
@@ -332,44 +319,37 @@ async def create_procurement_app_async(
         name="procurement_main_agent",
         description="动态协调采购分析、审批和执行",
         instructions=(
-            "你是企业采购 Main Agent，由你基于对话上下文动态选择、组合和重复调用专业 SubAgent，"
-            "首次调用 requirement_agent 时，task.text 必须原样携带当前用户的采购消息，不得只传"
-            "空上下文；修改会话时携带最新用户修改文本。"
+            "你是企业采购 Main Agent，只负责根据对话和正式 State 判断应调用哪个 SubAgent，"
+            "并传入该 SubAgent 完成目标所必需的上游结构化 State。首次调用 requirement_agent 时，"
+            "task.goal 必须原样携带当前用户采购消息；修改会话时携带最新用户修改文本。"
+            "不要在 task 中传入内部 Tool 参数、SQL、Skill 名称、分析策略或重试步骤。"
+            "不要替 SubAgent 选择或加载 Skill，也不要规定 SubAgent 应调用哪个 Tool；只描述业务目标。"
             "禁止按预设固定流水线机械调用。先判断已有证据和缺失字段；库存足够时直接结束。"
             "业务依赖必须严格遵守：requirement 无上游；inventory 依赖 requirement；supplier 依赖"
             "requirement+inventory；pricing 依赖 requirement+inventory+supplier；budget 依赖"
             "requirement+pricing；risk 依赖 requirement+supplier+pricing+budget；execution 依赖"
             "requirement+risk+budget。不得在上游正式结果返回前调用下游；互不依赖且依赖均满足的"
             "任务可并行。同一次模型响应中不得同时安排有前后依赖的 SubAgent，必须等上游结果写入"
-            "State 后在下一轮再安排下游。每次委派的 task 只携带相关结构化 State、analysis_strategy、"
-            "replan_reason 和 replan_start。会话修改时只重跑受影响的分析并复用其他有效结果。\n"
-            "反思策略：数据库结构或查询失败时以 schema_recovery 重试受影响 Agent；SubAgent 数据"
-            "不足时使用 fallback_recovery 并缩小查询目标；全部超预算时让 Pricing Agent 使用"
-            "cost_reduction，生成谈判目标或预算内分阶段备选，再重跑 Budget/Risk；交期不满足时先"
-            "让 Supplier Agent 使用 delivery_first，再让 Pricing Agent 使用 delivery_recovery；"
-            "供应商风险过高时让 Supplier Agent 使用 risk_first，Pricing Agent 使用"
-            "risk_diversification。一次重规划只在首个调整调用设置 replan_start=true。若新策略仍"
-            "违反硬约束，明确阻断执行并请求用户调整，不得伪造可行性。\n"
-            "形成可行方案后，把 request、recommended_plan、budget_analysis 交给 Execution Agent。"
-            "所有下游业务数据只读取应用层注入的已确认结构化 State，不得根据 facts、conclusion"
-            "或其他摘要重建数量、金额与方案；最新用户修改使相关旧结果失效，必须重新验证。"
-            "超预算时基于 budget_gap 与当前方案加载 cost-optimization，再委派 Pricing "
-            "以 cost_reduction 重规划；交期失败使用 delivery-recovery，供应商风险使用 "
-            "supplier-risk-review，紧急需求使用 urgent-procurement。先 load_skill 再应用策略。"
-            "不要复制 SQL、原始查询行或 MCP 包装；需要更多事实时重新委派对应分析 Tool 查询。"
+            "State 后在下一轮再安排下游。每次委派的 task 只能包含 goal 和相关 upstream_state。"
+            "会话修改时只重跑受影响的分析并复用其他有效结果。\n"
+            "重规划时只传业务目标，例如重新优化成本、优先满足交期或降低供应商风险；"
+            "不要把实现该目标的内部策略、Tool、Skill 或参数写进 task。若仍无满足硬约束的方案，"
+            "明确阻断执行并请求用户调整，不得伪造可行性。\n"
+            "形成可行方案后，把执行所需的正式 State 交给 Execution Agent。所有下游业务数据只读取"
+            "应用层注入的已确认结构化 State，不得根据 facts、conclusion 或其他摘要重建数量、金额"
+            "与方案；最新用户修改使相关旧结果失效，必须重新验证。"
+            "不要复制 SQL、原始查询行或 MCP 包装；需要更多事实时重新委派对应分析 SubAgent。"
             "Execution Agent 内部敏感 Tool 会触发 Harness HITL；未审批不得执行。最终必须返回指定"
             "结构化格式和可读 summary。"
         ),
         model=model_for("main"),
-        skills=main_skills,
-        skill_selector=selector,
+        skills=(),
         subagents=subagents,
         response_format=ProcurementDecision.model_json_schema(),
         state_schema=ProcurementState,
         runtime_config=main_config,
         middleware=[
             ProcurementContextMiddleware(enable_test_config=deterministic),
-            ProcurementSkillMiddleware("main", main_skills, selector),
             ProcurementOrchestrationMiddleware(enable_test_config=deterministic),
         ],
         checkpointer=checkpointer,

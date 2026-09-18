@@ -17,6 +17,7 @@ from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import Field, TypeAdapter
 
+from .business_validation import FIELD_BY_AGENT, STAGE_DEPENDENCIES
 from .schemas import ProcurementDecision
 from .test_runtime import current_test_config
 from .tool_contracts import (
@@ -283,6 +284,29 @@ class DeterministicProcurementModel(BaseChatModel):
         envelope = _parse(task)
         if not isinstance(envelope, dict):
             envelope = {}
+        upstream = envelope.get("upstream_state")
+        upstream = dict(upstream) if isinstance(upstream, Mapping) else envelope
+
+        # This is intentionally inside the SubAgent test model.  Production
+        # models make the same decision from the goal, available skills, Tool
+        # schemas, and returned observations; Main never supplies this value.
+        strategy = self._subagent_strategy(envelope, upstream)
+        reason = self._subagent_reason(upstream)
+        skill_messages = [
+            message
+            for message in messages[human_index + 1 :]
+            if isinstance(message, ToolMessage)
+            and message.name in {"load_skill", "unload_skill"}
+        ]
+        skill_name = f"{self.role}-analysis"
+        if (
+            self.role in QUERY_ROLES
+            and "load_skill" in self.bound_tool_names
+            and not skill_messages
+        ):
+            # The deterministic model is a black-box test double too: this is
+            # an internal model choice, not an application middleware action.
+            return _call("load_skill", {"name": skill_name})
         tool_messages = [
             message
             for message in messages[human_index + 1 :]
@@ -298,26 +322,28 @@ class DeterministicProcurementModel(BaseChatModel):
                     "execute_query",
                     {
                         "sql": "__mock__",
-                        "request": envelope.get("request"),
-                        "analysis_strategy": envelope.get("analysis_strategy"),
+                        "request": self._request(upstream),
+                        "analysis_strategy": strategy,
                     },
                 )
             if self.role == "requirement":
-                previous = envelope.get("previous_request") or None
+                previous = upstream.get("requirement", {}).get("request") or None
                 return _call(
                     primary,
                     {
-                        "text": envelope.get("text"),
+                        "text": envelope.get("goal"),
                         "previous_request": previous,
                     },
                 )
             if self.role == "execution":
+                requirement = upstream.get("requirement", {})
+                risk = upstream.get("risk_analysis", {})
                 return _call(
                     primary,
                     {
-                        "request": envelope.get("request"),
-                        "recommended_plan": envelope.get("recommended_plan"),
-                        "budget_analysis": envelope.get("budget_analysis"),
+                        "request": requirement.get("request"),
+                        "recommended_plan": risk.get("recommended_plan"),
+                        "budget_analysis": upstream.get("budget_analysis"),
                         "session_id": envelope.get("session_id"),
                     },
                 )
@@ -343,10 +369,13 @@ class DeterministicProcurementModel(BaseChatModel):
             return _call(
                 primary,
                 {
-                    **{key: envelope.get(key) for key in dependencies},
+                    **{
+                        key: self._subagent_input(upstream, key)
+                        for key in dependencies
+                    },
                     "query_result": _tool_value(query_messages[-1]),
-                    "analysis_strategy": envelope.get("analysis_strategy"),
-                    "replan_reason": envelope.get("replan_reason"),
+                    "analysis_strategy": strategy,
+                    "replan_reason": reason,
                 },
             )
 
@@ -400,8 +429,70 @@ class DeterministicProcurementModel(BaseChatModel):
 
         result = _tool_value(primary_messages[-1] if primary_messages else tool_messages[-1])
         if isinstance(result, str) and result.startswith("Error:"):
-            result = {"status": "error", "error": result}
+            if self.role == "execution" and "rejected" in result.casefold():
+                result = {
+                    "status": "failed",
+                    "error": {
+                        "type": "approval_rejected",
+                        "message": result,
+                        "retryable": False,
+                    },
+                    "executed_actions": [],
+                }
+            else:
+                result = {"status": "error", "error": result}
         return AIMessage(content=_json(result))
+
+    @staticmethod
+    def _subagent_input(upstream: Mapping[str, Any], key: str) -> Any:
+        if key == "request":
+            return upstream.get("requirement", {}).get("request")
+        return upstream.get(key)
+
+    @staticmethod
+    def _request(upstream: Mapping[str, Any]) -> Any:
+        return upstream.get("requirement", {}).get("request")
+
+    def _subagent_reason(self, upstream: Mapping[str, Any]) -> str | None:
+        for field in ("risk_analysis", "pricing_analysis", "supplier_analysis", "budget_analysis"):
+            value = upstream.get(field)
+            if isinstance(value, Mapping) and value.get("replan_reason"):
+                return str(value["replan_reason"])
+        return None
+
+    def _subagent_strategy(
+        self, envelope: Mapping[str, Any], upstream: Mapping[str, Any]
+    ) -> str:
+        goal = str(envelope.get("goal") or "")
+        lowered = goal.casefold()
+        recovery = any(word in goal for word in ("恢复", "重试", "重新完成")) or any(
+            word in lowered for word in ("recover", "retry")
+        )
+        test_config = current_test_config()
+        if recovery:
+            if self.role == "inventory" and test_config and test_config.simulate_sql_failure:
+                return "schema_recovery"
+            if test_config and test_config.simulate_subagent_failure:
+                return "fallback_recovery"
+            return "fallback_recovery"
+        if self.role == "supplier":
+            if any(word in goal for word in ("交期", "交付", "到货")):
+                return "delivery_first"
+            if any(word in goal for word in ("风险", "质量")):
+                return "risk_first"
+        if self.role == "pricing":
+            if any(word in goal for word in ("成本", "预算", "价格")):
+                return "cost_reduction"
+            if any(word in goal for word in ("交期", "交付", "到货")):
+                return "delivery_recovery"
+            if any(word in goal for word in ("风险", "分散")):
+                return "risk_diversification"
+        if self.role in {"budget", "risk"}:
+            pricing = upstream.get("pricing_analysis", {})
+            prior = str(pricing.get("analysis_strategy") or "")
+            if prior in {"cost_reduction", "delivery_recovery", "risk_diversification"}:
+                return f"revalidate_{prior}"
+        return "standard"
 
     def _main(self, messages: list[BaseMessage]) -> AIMessage:
         human_index = _latest_human_index(messages)
@@ -427,7 +518,12 @@ class DeterministicProcurementModel(BaseChatModel):
                 {
                     field: message_results[field]
                     for field in current_fields
-                    if field not in current and field in message_results
+                    if (
+                        field not in current
+                        and field in message_results
+                        and message_results[field].get("status") in {"error", "failed"}
+                        and self._failure_is_live(field, current_messages)
+                    )
                 }
             )
             previous = {
@@ -439,10 +535,20 @@ class DeterministicProcurementModel(BaseChatModel):
         current_counts = self._counts(current_messages)
 
         if "requirement" not in current:
-            previous_request = previous.get("requirement", {}).get("request", {})
             return _call(
                 "requirement_agent",
-                {"task": _json({"text": text, "previous_request": previous_request})},
+                {
+                    "task": _json(
+                        {
+                            "goal": text,
+                            "upstream_state": (
+                                {"requirement": previous["requirement"]}
+                                if previous.get("requirement")
+                                else {}
+                            ),
+                        }
+                    )
+                },
             )
 
         request_result = current["requirement"]
@@ -484,34 +590,16 @@ class DeterministicProcurementModel(BaseChatModel):
                 if role == "pricing_analysis" and "交期" in str(
                     current[role].get("conclusion", "")
                 ):
-                    if combined.get("supplier_analysis", {}).get("analysis_strategy") != (
-                        "delivery_first"
-                    ):
-                        return self._delegate(
-                            "supplier_analysis",
-                            combined,
-                            analysis_strategy="delivery_first",
-                            replan_reason="delivery_deadline_unmet",
-                            replan_start=True,
-                        )
                     return self._delegate(
-                        "pricing_analysis",
+                        "supplier_analysis",
                         combined,
-                        analysis_strategy="delivery_recovery",
-                        replan_reason="delivery_deadline_unmet",
+                        goal="优先满足交期",
                     )
                 if current_counts.get(agent_name, 0) < 2:
-                    error = current[role].get("error")
-                    database_failure = (
-                        "database" in str(error).casefold() or "table" in str(error).casefold()
-                    )
-                    strategy = "schema_recovery" if database_failure else "fallback_recovery"
                     return self._delegate(
                         role,
                         combined,
-                        analysis_strategy=strategy,
-                        replan_reason="data_or_subagent_failure",
-                        replan_start=True,
+                        goal="重新完成当前分析",
                     )
                 result = self._assemble(combined, approval="not_required", execution="blocked")
                 result["replan_count"] = 1
@@ -530,29 +618,18 @@ class DeterministicProcurementModel(BaseChatModel):
         ]
         if not risk.get("recommended_plan") and initial_full_route:
             risk_count = current_counts.get("risk_agent", 0)
-            supplier_strategy = str(
-                combined.get("supplier_analysis", {}).get("analysis_strategy") or "standard"
+            replan_already_attempted = any(
+                isinstance(combined.get(field), Mapping)
+                and str(combined[field].get("analysis_strategy") or "")
+                not in {"", "standard", "balanced"}
+                for field in (
+                    "supplier_analysis",
+                    "pricing_analysis",
+                    "budget_analysis",
+                    "risk_analysis",
+                )
             )
-            pricing_strategy = str(
-                combined.get("pricing_analysis", {}).get("analysis_strategy") or "standard"
-            )
-            budget_strategy = str(
-                combined.get("budget_analysis", {}).get("analysis_strategy") or "standard"
-            )
-            risk_strategy = str(
-                combined.get("risk_analysis", {}).get("analysis_strategy") or "standard"
-            )
-            supplier_replan_in_progress = supplier_strategy not in {"standard", "balanced"}
-            replan_in_progress = pricing_strategy not in {"standard", "balanced"}
-            if supplier_replan_in_progress and not replan_in_progress:
-                return self._delegate("pricing_analysis", combined)
-            if replan_in_progress:
-                downstream_strategy = f"revalidate_{pricing_strategy}"
-                if budget_strategy != downstream_strategy:
-                    return self._delegate("budget_analysis", combined)
-                if risk_strategy != downstream_strategy:
-                    return self._delegate("risk_analysis", combined)
-            elif risk_count == 1:
+            if risk_count == 1 and not replan_already_attempted:
                 reason = risk.get("replan_reason")
                 replan_role = (
                     "supplier_analysis"
@@ -563,17 +640,15 @@ class DeterministicProcurementModel(BaseChatModel):
                     }
                     else "pricing_analysis"
                 )
-                strategy = {
-                    "all_suppliers_over_budget": "cost_reduction",
-                    "delivery_deadline_unmet": "delivery_first",
-                    "supplier_risk_too_high": "risk_first",
-                }.get(str(reason), "fallback_recovery")
+                goal = {
+                    "all_suppliers_over_budget": "重新优化成本",
+                    "delivery_deadline_unmet": "优先满足交期",
+                    "supplier_risk_too_high": "降低供应商风险",
+                }.get(str(reason), "重新形成可执行方案")
                 return self._delegate(
                     replan_role,
-                    {**combined, "replan_reason": reason},
-                    analysis_strategy=strategy,
-                    replan_reason=reason,
-                    replan_start=True,
+                    combined,
+                    goal=goal,
                 )
 
         if not risk.get("recommended_plan"):
@@ -586,9 +661,12 @@ class DeterministicProcurementModel(BaseChatModel):
 
         if "execution" not in current:
             execution_task = {
-                "request": request,
-                "recommended_plan": risk["recommended_plan"],
-                "budget_analysis": combined.get("budget_analysis", {}),
+                "goal": "执行已确认采购方案",
+                "upstream_state": {
+                    "requirement": combined.get("requirement", {}),
+                    "risk_analysis": risk,
+                    "budget_analysis": combined.get("budget_analysis", {}),
+                },
             }
             return _call("execution_agent", {"task": _json(execution_task)})
 
@@ -702,13 +780,39 @@ class DeterministicProcurementModel(BaseChatModel):
         return counts
 
     @staticmethod
+    def _failure_is_live(field: str, messages: Sequence[BaseMessage]) -> bool:
+        """Ignore a failed result superseded by a refreshed upstream result."""
+
+        agent_by_field = {field_name: agent for agent, field_name in FIELD_BY_AGENT.items()}
+        agent_name = agent_by_field.get(field)
+        if not agent_name:
+            return True
+        failed_positions = [
+            index
+            for index, message in enumerate(messages)
+            if isinstance(message, ToolMessage) and message.name == agent_name
+        ]
+        if not failed_positions:
+            return False
+        failed_at = failed_positions[-1]
+        dependency_agents = {
+            agent_by_field[dependency]
+            for dependency in STAGE_DEPENDENCIES.get(agent_name, ())
+            if dependency in agent_by_field
+        }
+        return not any(
+            isinstance(message, ToolMessage)
+            and message.name in dependency_agents
+            and index > failed_at
+            for index, message in enumerate(messages)
+        )
+
+    @staticmethod
     def _delegate(
         role: str,
         combined: dict[str, Any],
         *,
-        analysis_strategy: str | None = None,
-        replan_reason: str | None = None,
-        replan_start: bool = False,
+        goal: str | None = None,
     ) -> AIMessage:
         names = {
             "inventory_analysis": "inventory_agent",
@@ -717,31 +821,47 @@ class DeterministicProcurementModel(BaseChatModel):
             "budget_analysis": "budget_agent",
             "risk_analysis": "risk_agent",
         }
-        if analysis_strategy is None and role == "pricing_analysis":
-            supplier_strategy = combined.get("supplier_analysis", {}).get("analysis_strategy")
-            analysis_strategy = {
-                "delivery_first": "delivery_recovery",
-                "risk_first": "risk_diversification",
-            }.get(supplier_strategy)
-        if analysis_strategy is None and role in {"budget_analysis", "risk_analysis"}:
-            upstream_strategy = combined.get("pricing_analysis", {}).get("analysis_strategy")
-            if upstream_strategy not in {None, "balanced", "standard"}:
-                analysis_strategy = f"revalidate_{upstream_strategy}"
-        task = {
-            "request": combined.get("requirement", {}).get("request", {}),
-            "inventory_analysis": combined.get("inventory_analysis", {}),
-            "supplier_analysis": combined.get("supplier_analysis", {}),
-            "pricing_analysis": combined.get("pricing_analysis", {}),
-            "budget_analysis": combined.get("budget_analysis", {}),
-            "risk_analysis": combined.get("risk_analysis", {}),
-            "replan_reason": replan_reason
-            or combined.get("replan_reason")
-            or combined.get("pricing_analysis", {}).get("replan_reason")
-            or combined.get("supplier_analysis", {}).get("replan_reason"),
-            "analysis_strategy": analysis_strategy or "standard",
-            "replan_start": replan_start,
+        state = {
+            field: combined[field]
+            for field in (
+                "requirement",
+                "inventory_analysis",
+                "supplier_analysis",
+                "pricing_analysis",
+                "budget_analysis",
+                "risk_analysis",
+            )
+            if field in combined
         }
+        task = {"goal": goal or DeterministicProcurementModel._business_goal(state), "upstream_state": state}
         return _call(names[role], {"task": _json(task)})
+
+    @staticmethod
+    def _business_goal(state: Mapping[str, Any]) -> str:
+        """Describe a replan in business language, never in Tool language."""
+
+        reasons = [
+            state.get("risk_analysis", {}).get("replan_reason"),
+            state.get("pricing_analysis", {}).get("replan_reason"),
+            state.get("supplier_analysis", {}).get("replan_reason"),
+        ]
+        goals = {
+            "all_suppliers_over_budget": "重新优化成本",
+            "delivery_deadline_unmet": "优先满足交期",
+            "supplier_risk_too_high": "降低供应商风险",
+        }
+        for reason in reasons:
+            if reason in goals:
+                return goals[reason]
+        for field in ("pricing_analysis", "supplier_analysis"):
+            strategy = str(state.get(field, {}).get("analysis_strategy") or "")
+            if strategy in {"cost_reduction", "revalidate_cost_reduction"}:
+                return "重新优化成本"
+            if strategy in {"delivery_first", "delivery_recovery", "revalidate_delivery_recovery"}:
+                return "优先满足交期"
+            if strategy in {"risk_first", "risk_diversification", "revalidate_risk_diversification"}:
+                return "降低供应商风险"
+        return "完成当前业务分析"
 
     @staticmethod
     def _empty_result(summary: str) -> dict[str, Any]:

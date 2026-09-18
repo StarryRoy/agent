@@ -1,17 +1,12 @@
 ---
 name: urgent-procurement
-description: 紧急采购下协调时间优先分析且不绕过预算与审批
+description: 紧急采购下帮助相关 SubAgent 进行时间优先判断且不绕过预算与审批
 version: "1.0.0"
 tags:
   - urgent
   - 紧急
   - 加急
-required_tools:
-  - inventory_agent
-  - supplier_agent
-  - pricing_agent
-  - budget_agent
-  - risk_agent
+required_tools: []
 dependencies: []
 scripts: []
 ---
@@ -29,23 +24,23 @@ scripts: []
 
 # Workflow
 
-1. 先确认关键需求字段，不完整则澄清。
-2. Inventory 计算缺口；Supplier 采用 `delivery_first`；Pricing 采用 `delivery_recovery`。
-3. Budget 与 Risk 重新验证所有条件性加急方案。
-4. 仅把满足硬约束的方案提交审批。
+1. 从上游 State 确认紧急程度、产品、数量、截止日期、质量要求、预算上限和排除供应商。
+2. 根据当前角色职责处理时间优先判断：需求角色确认紧急约束，库存角色确认缺口，供应商角色核验交付能力，定价角色比较加急/组合方案，预算角色核验预算，风险角色核验条件性方案与硬约束。
+3. 根据当前角色可用 Tool Schema、Schema 和 Metadata，自主选择分析、查询和重试路径。
+4. 紧急只改变业务优先级，不改变数量、预算、风险或审批要求；无法满足硬约束时明确阻断。
 
 # 需要查询的数据
 
-本 Skill 不直接查询；各专业 SubAgent 按自己的正常 Skill 动态查询相关表。
+各专业 SubAgent 仅按自身角色和可用 Schema/Metadata 获取必要事实，不委派其他 Agent。
 
 # 查询结果字段契约
 
-库存结果含缺口；供应商结果含交期窗口；定价方案含数量、最大交期、总额和条件标记；预算与风险结果含最终硬约束结论。
+按当前角色返回相应结构化结果：库存结果含缺口；供应商结果含交期窗口；定价方案含数量、最大交期、总额和条件标记；预算与风险结果含硬约束结论。
 
 # 判断与异常处理
 
-紧急不代表预算或审批豁免。任何查询失败均由对应 SubAgent 基于 Harness 错误和其 Schema/Metadata 修正。
+紧急不代表预算或审批豁免。任何查询失败均由当前 SubAgent 基于 Harness 错误和其 Schema/Metadata 自主修正或安全降级。
 
 # 输出要求
 
-输出结构化日期、数量、金额、条件、风险、来源标识和待审批状态。
+输出当前角色负责的结构化日期、数量、金额、条件、风险、来源标识和审批约束状态。

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from typing import Any, ClassVar
+from typing import Any
 
 from agent_harness import AgentMiddleware, EventType, ToolRequest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -19,18 +19,8 @@ from .business_validation import (
     missing_dependencies,
     validate_business_result,
 )
-from .context import decode, task_view
+from .context import DEPENDENCIES, decode, task_view
 from .test_runtime import ProcurementTestConfig, use_test_config
-
-
-def _tool_contract_value(value: Any) -> Any:
-    """Remove SubAgent-only annotations before strict calculator validation."""
-
-    if isinstance(value, Mapping):
-        return {key: _tool_contract_value(item) for key, item in value.items() if key != "remarks"}
-    if isinstance(value, list):
-        return [_tool_contract_value(item) for item in value]
-    return value
 
 
 class ProcurementOrchestrationMiddleware(AgentMiddleware):
@@ -90,6 +80,16 @@ class ProcurementOrchestrationMiddleware(AgentMiddleware):
 
     @staticmethod
     def _prepare(request: ToolRequest) -> None:
+        """Prepare only the child task's formal upstream State.
+
+        The request is a SubAgent boundary, so application code may add the
+        canonical State projection here.  It must not rewrite arguments for any
+        Tool called inside the child; those arguments are generated and owned by
+        the child agent.
+        """
+
+        if request.tool.name not in FIELD_BY_AGENT:
+            return
         if "task" not in request.arguments:
             return
         raw_task = request.arguments.get("task")
@@ -106,43 +106,33 @@ class ProcurementOrchestrationMiddleware(AgentMiddleware):
         results = request.state.get("procurement_results")
         results = dict(results) if isinstance(results, Mapping) else {}
         requirement = results.get("requirement", {})
+        source_text = request.execution.metadata.get("procurement_source_text")
+        goal = task.get("goal") or task.get("text")
+        if request.tool.name == "requirement_agent" and isinstance(source_text, str) and source_text.strip():
+            goal = source_text
+
         if request.tool.name == "requirement_agent":
-            source_text = request.execution.metadata.get("procurement_source_text")
-            if isinstance(source_text, str) and source_text.strip():
-                task["text"] = source_text
-            task["previous_request"] = requirement.get("request") or None
+            upstream = {"requirement": requirement} if requirement else {}
         else:
-            task["request"] = requirement.get("request")
-            task.setdefault("analysis_strategy", "standard")
-            task.setdefault("replan_reason", None)
-        for field in (
-            "inventory_analysis",
-            "supplier_analysis",
-            "pricing_analysis",
-            "budget_analysis",
-        ):
-            if field in results:
-                task[field] = results[field]
-        if request.tool.name == "execution_agent":
-            task["recommended_plan"] = results["risk_analysis"]["recommended_plan"]
-        task = task_view(request.tool.name, task)
+            raw_state = task.get("upstream_state")
+            upstream = dict(raw_state) if isinstance(raw_state, Mapping) else {}
+            # The formal State is authoritative and is the only source from
+            # which the application may prepare child business context.
+            upstream.update(
+                {
+                    field: results[field]
+                    for field in DEPENDENCIES[request.tool.name]
+                    if field in results
+                }
+            )
+
+        task = task_view(
+            request.tool.name,
+            {"goal": goal, "upstream_state": upstream},
+        )
 
         if request.tool.name == "execution_agent":
             task["session_id"] = request.execution.session_id
-
-        strategy = str(task.get("analysis_strategy") or "")
-        if strategy and strategy not in {"standard", "balanced"} and task.get("replan_start"):
-            metadata: dict[str, Any] = {
-                "subagent": request.tool.name,
-                "strategy": strategy,
-                "reason": task.get("replan_reason"),
-            }
-            if request.execution.debug is not None:
-                request.execution.debug.emit(
-                    EventType.PLAN_REPLAN,
-                    status="replanning",
-                    metadata=metadata,
-                )
         request.arguments = {**request.arguments, "task": json.dumps(task, ensure_ascii=False)}
 
     def _test_config(self, request: ToolRequest) -> ProcurementTestConfig | None:
@@ -218,6 +208,24 @@ class ProcurementOrchestrationMiddleware(AgentMiddleware):
             updated_results.pop(field, None)
         updated_results[FIELD_BY_AGENT[request.tool.name]] = normalized
         confirmed_value = {**value, "content": normalized}
+        strategy = str(normalized.get("analysis_strategy") or "")
+        if strategy and strategy not in {"standard", "balanced"}:
+            task = decode(request.arguments.get("task"))
+            goal = task.get("goal") if isinstance(task, Mapping) else None
+            emitted = request.execution.metadata.setdefault("procurement_replan_goals", set())
+            if isinstance(emitted, set) and goal and goal not in emitted:
+                emitted.add(goal)
+                if request.execution.debug is not None:
+                    request.execution.debug.emit(
+                        EventType.PLAN_REPLAN,
+                        status="replanning",
+                        metadata={
+                            "subagent": request.tool.name,
+                            "strategy": strategy,
+                            "reason": normalized.get("replan_reason"),
+                            "goal": goal,
+                        },
+                    )
         # A fresh top-level value is essential: LangGraph receives a formal
         # State update and the checkpointer writes it, rather than relying on a
         # mutation through a shared nested-dict reference.
@@ -236,81 +244,9 @@ class ProcurementOrchestrationMiddleware(AgentMiddleware):
 
 
 class ProcurementBusinessToolMiddleware(AgentMiddleware):
-    """Pin calculator inputs to the exact structured task received by a SubAgent."""
+    """Compatibility shim; internal Tool arguments belong to the SubAgent.
 
-    TOOL_FIELDS: ClassVar[dict[str, tuple[str, ...]]] = {
-        "parse_requirement": ("text", "previous_request"),
-        "calculate_inventory": ("request", "analysis_strategy", "replan_reason"),
-        "calculate_suppliers": (
-            "request",
-            "inventory_analysis",
-            "analysis_strategy",
-            "replan_reason",
-        ),
-        "calculate_pricing": (
-            "request",
-            "inventory_analysis",
-            "supplier_analysis",
-            "analysis_strategy",
-            "replan_reason",
-        ),
-        "calculate_budget": (
-            "request",
-            "pricing_analysis",
-            "analysis_strategy",
-            "replan_reason",
-        ),
-        "calculate_risk": (
-            "request",
-            "supplier_analysis",
-            "pricing_analysis",
-            "budget_analysis",
-            "analysis_strategy",
-            "replan_reason",
-        ),
-        "execute_procurement_plan": (
-            "request",
-            "recommended_plan",
-            "budget_analysis",
-            "session_id",
-        ),
-    }
-
-    @staticmethod
-    def _task(request: ToolRequest) -> dict[str, Any]:
-        messages = request.execution.input.get("messages", [])
-        for message in messages:
-            value = decode(getattr(message, "content", None))
-            if isinstance(value, Mapping):
-                return dict(value)
-        return {}
-
-    def wrap_tool_call(self, request: ToolRequest, call_next: Any) -> Any:
-        fields = self.TOOL_FIELDS.get(request.tool.name)
-        if fields:
-            task = self._task(request)
-            missing = [field for field in fields if field not in task]
-            if missing:
-                raise BusinessConsistencyError(
-                    f"{request.tool.name} 缺少确认任务字段: {', '.join(missing)}"
-                )
-            request.arguments = {
-                **request.arguments,
-                **{field: _tool_contract_value(task[field]) for field in fields},
-            }
-        return call_next(request)
-
-    async def awrap_tool_call(self, request: ToolRequest, call_next: Any) -> Any:
-        fields = self.TOOL_FIELDS.get(request.tool.name)
-        if fields:
-            task = self._task(request)
-            missing = [field for field in fields if field not in task]
-            if missing:
-                raise BusinessConsistencyError(
-                    f"{request.tool.name} 缺少确认任务字段: {', '.join(missing)}"
-                )
-            request.arguments = {
-                **request.arguments,
-                **{field: _tool_contract_value(task[field]) for field in fields},
-            }
-        return await call_next(request)
+    The application intentionally performs no argument pinning or rewriting.
+    New composition does not install this middleware, but keeping a no-op
+    implementation avoids breaking callers that imported the old extension.
+    """
