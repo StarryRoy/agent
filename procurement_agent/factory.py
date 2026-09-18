@@ -360,9 +360,9 @@ async def create_procurement_app_async(
         state_schema=ProcurementState,
         runtime_config=main_config,
         middleware=[
-            ProcurementContextMiddleware(),
+            ProcurementContextMiddleware(enable_test_config=deterministic),
             ProcurementSkillMiddleware("main", main_skills, selector),
-            ProcurementOrchestrationMiddleware(),
+            ProcurementOrchestrationMiddleware(enable_test_config=deterministic),
         ],
         checkpointer=checkpointer,
         event_sinks=sinks,

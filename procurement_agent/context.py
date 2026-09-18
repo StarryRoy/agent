@@ -111,7 +111,11 @@ def task_view(name: str, task: dict) -> dict:
         **context,
         "replan_reason": task.get("replan_reason") or context.get("replan_reason"),
     }
-    allowed = DEPENDENCIES[name] | {"analysis_strategy", "replan_reason", "replan_start"}
+    allowed = DEPENDENCIES[name] | {
+        "analysis_strategy",
+        "replan_reason",
+        "replan_start",
+    }
     return {
         **{key: value for key, value in task.items() if key in allowed},
         "procurement_context": context,
@@ -119,6 +123,9 @@ def task_view(name: str, task: dict) -> dict:
 
 
 class ProcurementContextMiddleware(AgentMiddleware):
+    def __init__(self, *, enable_test_config: bool = False) -> None:
+        self.enable_test_config = enable_test_config
+
     def before_model(self, request: ModelRequest) -> None:
         # Keep the latest original user turn available to the parent tool-call
         # middleware. Real models can otherwise delegate an empty context to the
@@ -130,6 +137,17 @@ class ProcurementContextMiddleware(AgentMiddleware):
             source_text = value if isinstance(value, str) else None
             if isinstance(value, dict) and isinstance(value.get("text"), str):
                 source_text = value["text"]
+                simulation_fields = (
+                    "simulate_sql_failure",
+                    "simulate_subagent_failure",
+                    "simulate_mcp_failure",
+                    "simulate_execution_failure",
+                    "simulate_atomic_failure",
+                )
+                if self.enable_test_config and any(key in value for key in simulation_fields):
+                    request.execution.metadata["procurement_test_config"] = {
+                        key: value.get(key, False) for key in simulation_fields
+                    }
             if source_text and source_text.strip():
                 request.execution.metadata["procurement_source_text"] = source_text
             break

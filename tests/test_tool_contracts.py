@@ -6,11 +6,14 @@ from pathlib import Path
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
+from procurement_agent.models import build_mock_execute_query_tool
 from procurement_agent.services import ProcurementServices
+from procurement_agent.test_runtime import ProcurementTestConfig, use_test_config
 from procurement_agent.tool_contracts import (
     TOOL_CONTRACTS,
     Evidence,
     PricingArgs,
+    ProcurementRequest,
     RiskArgs,
     SupplierAnalysis,
 )
@@ -46,6 +49,17 @@ def _query(rows):
     }
 
 
+def _test_config(**overrides):
+    return {
+        "simulate_sql_failure": False,
+        "simulate_subagent_failure": False,
+        "simulate_mcp_failure": False,
+        "simulate_execution_failure": False,
+        "simulate_atomic_failure": False,
+        **overrides,
+    }
+
+
 def test_every_business_tool_uses_its_explicit_pydantic_contract():
     tools = _tools()
     assert set(tools) == set(TOOL_CONTRACTS)
@@ -55,6 +69,10 @@ def test_every_business_tool_uses_its_explicit_pydantic_contract():
         assert tool.metadata["output_schema"] == output_schema.model_json_schema()
         assert "task" not in args_schema.model_fields
         assert "plan_json" not in args_schema.model_fields
+        assert "test_config" not in args_schema.model_fields
+        serialized_schema = json.dumps(args_schema.model_json_schema())
+        assert "test_config" not in serialized_schema
+        assert "simulate_" not in serialized_schema
         for field in args_schema.model_fields.values():
             assert field.is_required()
             assert field.description
@@ -83,6 +101,29 @@ def test_requirement_tool_returns_output_validated_by_declared_model():
     validated = output_schema.model_validate(result)
     assert validated.request.quantity == 500
     assert validated.request.budget == 800000
+
+
+def test_fault_injection_is_separate_from_business_request():
+    assert not any(name.startswith("simulate_") for name in ProcurementRequest.model_fields)
+    config = ProcurementTestConfig.model_validate(_test_config(simulate_sql_failure=True))
+    tools = _tools()
+    query_tool = build_mock_execute_query_tool("inventory")
+    assert "simulate_" not in json.dumps(query_tool.args_schema.model_json_schema())
+    with use_test_config(config):
+        result = tools["parse_requirement"].invoke(
+            {"text": "下个月采购500台设备，预算80万。", "previous_request": None}
+        )
+        query_result = query_tool.invoke(
+            {
+                "sql": "__mock__",
+                "request": result["request"],
+                "analysis_strategy": "standard",
+            }
+        )
+    assert not any(field.startswith("simulate_") for field in result["request"])
+    assert "test_config" not in result
+    assert query_result["ok"] is False
+    assert query_result["error"]["type"] == "table_not_found"
 
 
 def test_all_analysis_tool_outputs_satisfy_their_declared_models():
@@ -149,10 +190,61 @@ def test_all_analysis_tool_outputs_satisfy_their_declared_models():
     assert execution["status"] == "success"
     assert execution["purchase_request_id"] == 101
 
-    request["simulate_execution_failure"] = True
-    execution = tools["execute_procurement_plan"].invoke(execution_arguments)
+    config = ProcurementTestConfig.model_validate(_test_config(simulate_execution_failure=True))
+    with use_test_config(config):
+        execution = tools["execute_procurement_plan"].invoke(execution_arguments)
     assert execution["status"] == "failed"
     assert execution["error"]["type"] == "scripted_execution_failure"
+
+
+def test_normal_business_request_has_no_simulation_fields_and_completes_analysis():
+    tools = _tools()
+    fixtures = _fixtures()
+    request = tools["parse_requirement"].invoke(
+        {"text": "下个月采购500台设备，预算80万。", "previous_request": None}
+    )["request"]
+    assert not any(field.startswith("simulate_") for field in request)
+
+    common = {"analysis_strategy": "standard", "replan_reason": None}
+    inventory = tools["calculate_inventory"].invoke(
+        {"request": request, "query_result": _query(fixtures["inventory"]["1"]), **common}
+    )
+    suppliers = tools["calculate_suppliers"].invoke(
+        {
+            "request": request,
+            "inventory_analysis": inventory,
+            "query_result": _query(fixtures["supplier"]["1"]),
+            **common,
+        }
+    )
+    pricing = tools["calculate_pricing"].invoke(
+        {
+            "request": request,
+            "inventory_analysis": inventory,
+            "supplier_analysis": suppliers,
+            "query_result": _query(fixtures["pricing"]["1"]),
+            **common,
+        }
+    )
+    budget = tools["calculate_budget"].invoke(
+        {
+            "request": request,
+            "pricing_analysis": pricing,
+            "query_result": _query(fixtures["budget"]["IT"]),
+            **common,
+        }
+    )
+    risk = tools["calculate_risk"].invoke(
+        {
+            "request": request,
+            "supplier_analysis": suppliers,
+            "pricing_analysis": pricing,
+            "budget_analysis": budget,
+            "query_result": _query(fixtures["risk"]["1"]),
+            **common,
+        }
+    )
+    assert risk["status"] == "success"
 
 
 def test_all_analysis_error_outputs_satisfy_their_declared_models():

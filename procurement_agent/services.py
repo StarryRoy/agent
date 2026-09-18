@@ -16,6 +16,7 @@ from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, TypeAdapter
 
 from .database import read_sql_asset
+from .test_runtime import current_test_config
 from .tool_contracts import (
     TOOL_CONTRACTS,
     AnalysisStrategy,
@@ -98,7 +99,9 @@ class ProcurementServices:
     today: date
 
     def parse_requirement(
-        self, text: str, previous_request: ProcurementRequest | None
+        self,
+        text: str,
+        previous_request: ProcurementRequest | None,
     ) -> dict[str, Any]:
         envelope: dict[str, Any] = {"text": text}
         text = text.strip()
@@ -224,17 +227,6 @@ class ProcurementServices:
                     request["selected_plan_index"] = index
                     break
 
-        simulations = {
-            key: envelope.get(key, False)
-            for key in (
-                "simulate_sql_failure",
-                "simulate_subagent_failure",
-                "simulate_mcp_failure",
-                "simulate_execution_failure",
-                "simulate_atomic_failure",
-            )
-        }
-        request.update(simulations)
         missing = [field for field in ("product", "quantity") if not request.get(field)]
         return {
             "subtask": "requirement_extraction",
@@ -257,7 +249,12 @@ class ProcurementServices:
 
         request = request.model_dump(mode="json")
         strategy = str(analysis_strategy.value)
-        if request.get("simulate_subagent_failure") and strategy != "fallback_recovery":
+        test_config = current_test_config()
+        if (
+            test_config
+            and test_config.simulate_subagent_failure
+            and strategy != "fallback_recovery"
+        ):
             raise RuntimeError("scripted inventory SubAgent failure")
         records, evidence, error = _consume_query_result("inventory_and_consumption", query_result)
         if error:
@@ -339,8 +336,10 @@ class ProcurementServices:
         request = request.model_dump(mode="json")
         inventory = inventory_analysis.model_dump(mode="json")
         strategy = str(analysis_strategy.value)
+        test_config = current_test_config()
         if (
-            request.get("simulate_subagent_failure") == "supplier"
+            test_config
+            and test_config.simulate_subagent_failure == "supplier"
             and strategy != "fallback_recovery"
         ):
             raise RuntimeError("scripted supplier SubAgent failure")
@@ -903,7 +902,8 @@ class ProcurementServices:
         request = request.model_dump(mode="json")
         plan = recommended_plan.model_dump(mode="json")
         budget = budget_analysis.model_dump(mode="json")
-        if request.get("simulate_execution_failure"):
+        test_config = current_test_config()
+        if test_config and test_config.simulate_execution_failure:
             return {
                 "status": "failed",
                 "error": {
@@ -918,7 +918,7 @@ class ProcurementServices:
         request_no = f"PR-{self.today:%Y%m%d}-{nonce}"
         average_price = total_cost / int(plan["quantity"])
         transactional_plan = dict(plan)
-        if request.get("simulate_atomic_failure"):
+        if test_config and test_config.simulate_atomic_failure:
             transactional_plan["__force_failure"] = True
 
         # One DatabaseToolkit write is the transaction boundary. SQLite executes all

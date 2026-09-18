@@ -12,6 +12,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from procurement_agent import create_procurement_app
 from procurement_agent.context import ProcurementContextMiddleware, task_view
 from procurement_agent.middleware import ProcurementOrchestrationMiddleware
+from procurement_agent.test_runtime import current_test_config
 
 
 def test_each_query_subagent_loads_only_its_domain_skill(tmp_path):
@@ -65,13 +66,11 @@ def test_replanning_skills_are_loaded_only_by_main_agent(tmp_path, text, skill):
         ]
         loads = [event for event in events if event["event_type"] == "skill.load"]
         assert any(
-            event["agent_name"] == "procurement_main_agent"
-            and skill in event["metadata"]["skills"]
+            event["agent_name"] == "procurement_main_agent" and skill in event["metadata"]["skills"]
             for event in loads
         )
         assert not any(
-            event["agent_name"] != "procurement_main_agent"
-            and skill in event["metadata"]["skills"]
+            event["agent_name"] != "procurement_main_agent" and skill in event["metadata"]["skills"]
             for event in loads
         )
     finally:
@@ -110,11 +109,19 @@ def test_context_preserves_gap_plan_and_raw_checkpoint_message():
             "budget_analysis": budget,
             "pricing_analysis": {"recommended_price_plan": plan},
             "replan_reason": "all_suppliers_over_budget",
+            "test_config": {
+                "simulate_sql_failure": False,
+                "simulate_subagent_failure": False,
+                "simulate_mcp_failure": True,
+                "simulate_execution_failure": False,
+                "simulate_atomic_failure": False,
+            },
         },
     )
     assert "budget_analysis" not in task and "pricing_analysis" not in task
     assert task["procurement_context"]["budget_gap"] == 123.45
     assert task["procurement_context"]["current_plan"] == plan
+    assert "test_config" not in task
 
 
 def test_format_request_ends_with_user_message_for_gemini_structured_output():
@@ -136,14 +143,17 @@ def test_format_request_ends_with_user_message_for_gemini_structured_output():
 
 def test_requirement_delegation_recovers_original_user_text_from_parent_execution():
     source_text = "下个月采购500台设备，预算80万，月底前到货。"
+    user_message = json.dumps(
+        {"text": source_text, "simulate_sql_failure": True}, ensure_ascii=False
+    )
     execution = AgentExecution("main", {}, session_id="requirement-source")
     model_request = ModelRequest(
         execution,
-        {"messages": [HumanMessage(content=source_text)]},
-        [HumanMessage(content=source_text)],
+        {"messages": [HumanMessage(content=user_message)]},
+        [HumanMessage(content=user_message)],
         {},
     )
-    ProcurementContextMiddleware().before_model(model_request)
+    ProcurementContextMiddleware(enable_test_config=True).before_model(model_request)
     tool_request = ToolRequest(
         execution,
         SimpleNamespace(name="requirement_agent"),
@@ -157,7 +167,32 @@ def test_requirement_delegation_recovers_original_user_text_from_parent_executio
         "requirement-call",
     )
 
-    ProcurementOrchestrationMiddleware._prepare(tool_request)
+    observed = {}
+
+    def call_next(request):
+        observed["config"] = current_test_config()
+        return request
+
+    middleware = ProcurementOrchestrationMiddleware(enable_test_config=True)
+    middleware.wrap_tool_call(tool_request, call_next)
 
     task = json.loads(tool_request.arguments["task"])
     assert task["text"] == source_text
+    assert "test_config" not in task
+    assert observed["config"].simulate_sql_failure is True
+    assert observed["config"].simulate_execution_failure is False
+    assert current_test_config() is None
+
+
+def test_production_context_does_not_enable_fault_injection_metadata():
+    execution = AgentExecution("main", {}, session_id="production-context")
+    message = HumanMessage(
+        content=json.dumps(
+            {"text": "采购500台设备", "simulate_sql_failure": True}, ensure_ascii=False
+        )
+    )
+    request = ModelRequest(execution, {"messages": [message]}, [message], {})
+
+    ProcurementContextMiddleware().before_model(request)
+
+    assert "procurement_test_config" not in execution.metadata

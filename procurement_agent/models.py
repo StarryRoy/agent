@@ -18,6 +18,7 @@ from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import Field, TypeAdapter
 
 from .schemas import ProcurementDecision
+from .test_runtime import current_test_config
 from .tool_contracts import (
     AnalysisStrategy,
     BudgetQuerySuccess,
@@ -80,9 +81,11 @@ def build_mock_execute_query_tool(role: str) -> BaseTool:
         del sql
         request_data = request.model_dump(mode="json")
         strategy = analysis_strategy.value
+        test_config = current_test_config()
         if (
             role == "inventory"
-            and request_data.get("simulate_sql_failure")
+            and test_config
+            and test_config.simulate_sql_failure
             and strategy != "schema_recovery"
         ):
             result = {
@@ -290,7 +293,10 @@ class DeterministicProcurementModel(BaseChatModel):
                 previous = envelope.get("previous_request") or None
                 return _call(
                     primary,
-                    {"text": envelope.get("text"), "previous_request": previous},
+                    {
+                        "text": envelope.get("text"),
+                        "previous_request": previous,
+                    },
                 )
             if self.role == "execution":
                 return _call(
@@ -343,7 +349,8 @@ class DeterministicProcurementModel(BaseChatModel):
             )
             force_failure = False
             try:
-                force_failure = bool(envelope.get("request", {}).get("simulate_mcp_failure"))
+                test_config = current_test_config()
+                force_failure = bool(test_config and test_config.simulate_mcp_failure)
             except AttributeError:
                 pass
             return _call(

@@ -48,13 +48,6 @@ class ProcurementRequest(ContractModel):
     department_code: NonEmpty = Field(..., description="预算所属部门编码。")
     other_constraints: list[str] = Field(..., description="其他采购约束。")
     selected_plan_index: int | None = Field(..., ge=1, description="用户选择的方案序号。")
-    simulate_sql_failure: bool = Field(..., description="测试用 SQL 失败开关。")
-    simulate_subagent_failure: bool | Literal["supplier"] = Field(
-        ..., description="测试用 SubAgent 失败开关。"
-    )
-    simulate_mcp_failure: bool = Field(..., description="测试用 MCP 失败开关。")
-    simulate_execution_failure: bool = Field(..., description="测试用执行失败开关。")
-    simulate_atomic_failure: bool = Field(..., description="测试用事务失败开关。")
 
 
 class ActionableProcurementRequest(ProcurementRequest):
