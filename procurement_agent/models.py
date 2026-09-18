@@ -8,16 +8,27 @@ import uuid
 from collections.abc import Sequence
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import BaseTool, StructuredTool
-from pydantic import Field
+from pydantic import Field, TypeAdapter
 
 from .schemas import ProcurementDecision
+from .tool_contracts import (
+    AnalysisStrategy,
+    BudgetQuerySuccess,
+    ContractModel,
+    InventoryQuerySuccess,
+    PricingQuerySuccess,
+    ProcurementRequest,
+    QueryFailure,
+    RiskQuerySuccess,
+    SupplierQuerySuccess,
+)
 
 ROLE_TO_TOOL = {
     "requirement": "parse_requirement",
@@ -32,6 +43,14 @@ ROLE_TO_TOOL = {
 QUERY_ROLES = {"inventory", "supplier", "pricing", "budget", "risk"}
 
 
+class MockExecuteQueryArgs(ContractModel):
+    """Explicit input contract for the deterministic query test double."""
+
+    sql: Literal["__mock__"] = Field(..., description="Deterministic query marker.")
+    request: ProcurementRequest = Field(..., description="Structured procurement request.")
+    analysis_strategy: AnalysisStrategy = Field(..., description="Active analysis strategy.")
+
+
 @lru_cache(maxsize=1)
 def _mock_query_fixtures() -> dict[str, Any]:
     path = Path(__file__).with_name("fixtures") / "query_results.json"
@@ -44,21 +63,29 @@ def build_mock_execute_query_tool(role: str) -> BaseTool:
     if role not in QUERY_ROLES:
         raise ValueError(f"role does not query: {role}")
 
+    query_outputs = {
+        "inventory": InventoryQuerySuccess,
+        "supplier": SupplierQuerySuccess,
+        "pricing": PricingQuerySuccess,
+        "budget": BudgetQuerySuccess,
+        "risk": RiskQuerySuccess,
+    }
+    output_adapter = TypeAdapter(query_outputs[role] | QueryFailure)
+
     def execute_query(
-        sql: str, parameters: dict[str, Any] | list[Any] | None = None
+        sql: str,
+        request: ProcurementRequest,
+        analysis_strategy: AnalysisStrategy,
     ) -> dict[str, Any]:
         del sql
-        task_value = parameters.get("task", "{}") if isinstance(parameters, dict) else "{}"
-        task = _parse(task_value)
-        envelope = task if isinstance(task, dict) else {}
-        request = dict(envelope.get("request") or envelope)
-        strategy = str(envelope.get("analysis_strategy") or "standard")
+        request_data = request.model_dump(mode="json")
+        strategy = analysis_strategy.value
         if (
             role == "inventory"
-            and request.get("simulate_sql_failure")
+            and request_data.get("simulate_sql_failure")
             and strategy != "schema_recovery"
         ):
-            return {
+            result = {
                 "ok": False,
                 "operation": "execute_query",
                 "error": {
@@ -67,28 +94,37 @@ def build_mock_execute_query_tool(role: str) -> BaseTool:
                     "retryable": False,
                 },
             }
-        fixtures = _mock_query_fixtures()[role]
-        key = (
-            str(request.get("department_code") or "IT")
-            if role == "budget"
-            else str(request.get("product_id") or "")
-        )
-        rows = list(fixtures.get(key, []))
-        return {
-            "ok": True,
-            "operation": "execute_query",
-            "columns": list(rows[0]) if rows else [],
-            "rows": rows,
-            "row_count": len(rows),
-            "truncated": False,
-        }
+        else:
+            fixtures = _mock_query_fixtures()[role]
+            key = (
+                str(request_data.get("department_code") or "IT")
+                if role == "budget"
+                else str(request_data.get("product_id") or "")
+            )
+            rows = list(fixtures.get(key, []))
+            result = {
+                "ok": True,
+                "operation": "execute_query",
+                "columns": list(rows[0]) if rows else [],
+                "rows": rows,
+                "row_count": len(rows),
+                "truncated": False,
+            }
+        return output_adapter.validate_python(result).model_dump(mode="json")
 
-    return StructuredTool.from_function(
-        execute_query,
+    return StructuredTool(
+        func=execute_query,
         name="execute_query",
         description="Mock execute_query Tool for deterministic tests; returns contract-shaped rows.",
-        metadata={"database_toolkit": True, "database_operation": "read", "mock": True},
+        args_schema=MockExecuteQueryArgs,
+        metadata={
+            "database_toolkit": True,
+            "database_operation": "read",
+            "mock": True,
+            "output_schema": output_adapter.json_schema(),
+        },
     )
+
 
 SUBAGENT_TO_FIELD = {
     "requirement_agent": "requirement",
@@ -228,6 +264,9 @@ class DeterministicProcurementModel(BaseChatModel):
         if human_index < 0:
             return AIMessage(content=_json({"status": "error", "error": "missing task"}))
         task = _human_text(messages[human_index])
+        envelope = _parse(task)
+        if not isinstance(envelope, dict):
+            envelope = {}
         tool_messages = [
             message
             for message in messages[human_index + 1 :]
@@ -239,18 +278,57 @@ class DeterministicProcurementModel(BaseChatModel):
             if self.role in QUERY_ROLES:
                 # Deterministic tests bind execute_query to a Mock Tool. No query
                 # statement is stored or generated by this test model.
-                return _call("execute_query", {"sql": "__mock__", "parameters": {"task": task}})
-            argument_name = "plan_json" if self.role == "execution" else "task"
-            return _call(primary, {argument_name: task})
+                return _call(
+                    "execute_query",
+                    {
+                        "sql": "__mock__",
+                        "request": envelope.get("request"),
+                        "analysis_strategy": envelope.get("analysis_strategy"),
+                    },
+                )
+            if self.role == "requirement":
+                previous = envelope.get("previous_request") or None
+                return _call(
+                    primary,
+                    {"text": envelope.get("text"), "previous_request": previous},
+                )
+            if self.role == "execution":
+                return _call(
+                    primary,
+                    {
+                        "request": envelope.get("request"),
+                        "recommended_plan": envelope.get("recommended_plan"),
+                        "budget_analysis": envelope.get("budget_analysis"),
+                        "session_id": envelope.get("session_id"),
+                    },
+                )
+            raise AssertionError(f"query role {self.role} must execute a query first")
 
         query_messages = [item for item in tool_messages if item.name == "execute_query"]
         primary_messages = [item for item in tool_messages if item.name == primary]
         external_messages = [item for item in tool_messages if item.name == "supplier_status"]
 
         if self.role in QUERY_ROLES and query_messages and not primary_messages:
+            dependencies = {
+                "inventory": ("request",),
+                "supplier": ("request", "inventory_analysis"),
+                "pricing": ("request", "inventory_analysis", "supplier_analysis"),
+                "budget": ("request", "pricing_analysis"),
+                "risk": (
+                    "request",
+                    "supplier_analysis",
+                    "pricing_analysis",
+                    "budget_analysis",
+                ),
+            }[self.role]
             return _call(
                 primary,
-                {"task": task, "query_result": _tool_value(query_messages[-1])},
+                {
+                    **{key: envelope.get(key) for key in dependencies},
+                    "query_result": _tool_value(query_messages[-1]),
+                    "analysis_strategy": envelope.get("analysis_strategy"),
+                    "replan_reason": envelope.get("replan_reason"),
+                },
             )
 
         if (
@@ -265,10 +343,8 @@ class DeterministicProcurementModel(BaseChatModel):
             )
             force_failure = False
             try:
-                force_failure = bool(
-                    json.loads(task).get("request", {}).get("simulate_mcp_failure")
-                )
-            except (json.JSONDecodeError, AttributeError):
+                force_failure = bool(envelope.get("request", {}).get("simulate_mcp_failure"))
+            except AttributeError:
                 pass
             return _call(
                 "supplier_status",

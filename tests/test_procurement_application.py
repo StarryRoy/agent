@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from datetime import date
 
 import pytest
@@ -11,6 +10,7 @@ from procurement_agent import factory as factory_module
 from procurement_agent.evaluation import run_evaluation
 from procurement_agent.models import DeterministicProcurementModel
 from procurement_agent.services import ProcurementServices
+from procurement_agent.tool_contracts import ExecutionArgs
 
 TODAY = date(2026, 9, 10)
 REQUEST = "下个月需要采购500台设备，预算80万，月底前必须到货。"
@@ -496,11 +496,16 @@ def test_business_connection_enforces_foreign_keys_and_recovers(app, tmp_path):
     proposal = app.submit(REQUEST, session_id="foreign-key")
     assert proposal.status == "approval_required"
     envelope = {**proposal.data, "session_id": "foreign-key"}
-    envelope = json.loads(json.dumps(envelope))
-    envelope["recommended_plan"]["allocations"][-1]["supplier_id"] = -1
+    execution = ExecutionArgs.model_validate(envelope)
+    execution.recommended_plan.allocations[-1].supplier_id = -1
     database_before = _database_dump(app)
 
-    result = ProcurementServices(app.database, TODAY).execute_plan(json.dumps(envelope))
+    result = ProcurementServices(app.database, TODAY).execute_plan(
+        request=execution.request,
+        recommended_plan=execution.recommended_plan,
+        budget_analysis=execution.budget_analysis,
+        session_id=execution.session_id,
+    )
 
     assert result["status"] == "failed"
     assert result["error"]["database_error"]["type"] == "constraint_violation"

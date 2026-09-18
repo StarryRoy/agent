@@ -13,48 +13,36 @@ from typing import Any
 
 from agent_harness import DatabaseToolkit
 from langchain_core.tools import BaseTool, StructuredTool
+from pydantic import BaseModel, TypeAdapter
 
 from .database import read_sql_asset
+from .tool_contracts import (
+    TOOL_CONTRACTS,
+    AnalysisStrategy,
+    AssessedPlan,
+    BudgetAnalysis,
+    BudgetQuerySuccess,
+    InventoryAnalysis,
+    InventoryQuerySuccess,
+    PricingAnalysis,
+    PricingQuerySuccess,
+    ProcurementRequest,
+    QueryFailure,
+    RiskQuerySuccess,
+    SupplierAnalysis,
+    SupplierQuerySuccess,
+)
 
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
-def _payload(task: str) -> dict[str, Any]:
-    try:
-        parsed = json.loads(task)
-    except (TypeError, json.JSONDecodeError):
-        return {"text": str(task)}
-    return parsed if isinstance(parsed, dict) else {"text": str(task)}
-
-
-def _query_payload(value: dict[str, Any] | str) -> dict[str, Any]:
-    """Normalize a Harness Tool result passed back by the LLM to a calculator."""
-
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except json.JSONDecodeError:
-            return {
-                "ok": False,
-                "error": {"type": "invalid_query_result", "message": "查询结果不是 JSON 对象"},
-            }
-    if isinstance(value, dict) and {"content", "status"}.issubset(value):
-        content = value.get("content")
-        return _query_payload(content if isinstance(content, (dict, str)) else {})
-    return value if isinstance(value, dict) else {
-        "ok": False,
-        "error": {"type": "invalid_query_result", "message": "查询结果必须是对象"},
-    }
-
-
 def _consume_query_result(
     subtask: str,
-    query_result: dict[str, Any] | str,
-    required_fields: tuple[str, ...],
+    query_result: BaseModel,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any] | None]:
-    result = _query_payload(query_result)
+    result = query_result.model_dump(mode="json")
     evidence = {
         "source": "DatabaseToolkit.execute_query",
         "operation": result.get("operation", "execute_query"),
@@ -62,38 +50,28 @@ def _consume_query_result(
         "truncated": bool(result.get("truncated", False)),
         "subtask": subtask,
     }
-    if not result.get("ok"):
-        return [], evidence, result.get("error") or {
-            "type": "query_failed",
-            "message": "查询失败",
-        }
+    if isinstance(query_result, QueryFailure):
+        return (
+            [],
+            evidence,
+            result.get("error")
+            or {
+                "type": "query_failed",
+                "message": "查询失败",
+            },
+        )
     if result.get("truncated"):
-        return [], evidence, {
-            "type": "result_truncated",
-            "message": "查询结果被截断；请缩小过滤范围后重试",
-        }
+        return (
+            [],
+            evidence,
+            {
+                "type": "result_truncated",
+                "message": "查询结果被截断；请缩小过滤范围后重试",
+            },
+        )
     rows = list(result.get("rows") or [])
     if not rows:
         return [], evidence, {"type": "empty_result", "message": "查询未返回业务记录"}
-    if any(not isinstance(row, dict) for row in rows):
-        return [], evidence, {
-            "type": "result_contract_violation",
-            "message": "查询结果行必须是字段对象",
-        }
-    missing = sorted(
-        {
-            field
-            for row in rows
-            if isinstance(row, dict)
-            for field in required_fields
-            if field not in row
-        }
-    )
-    if missing:
-        return [], evidence, {
-            "type": "result_contract_violation",
-            "message": "查询结果缺少字段: " + ", ".join(missing),
-        }
     return rows, evidence, None
 
 
@@ -119,9 +97,11 @@ class ProcurementServices:
     database: DatabaseToolkit
     today: date
 
-    def parse_requirement(self, task: str) -> dict[str, Any]:
-        envelope = _payload(task)
-        text = str(envelope.get("text", "")).strip()
+    def parse_requirement(
+        self, text: str, previous_request: ProcurementRequest | None
+    ) -> dict[str, Any]:
+        envelope: dict[str, Any] = {"text": text}
+        text = text.strip()
         if text.startswith("{"):
             try:
                 embedded = json.loads(text)
@@ -130,7 +110,7 @@ class ProcurementServices:
             if isinstance(embedded, dict):
                 envelope = {**envelope, **embedded}
                 text = str(embedded.get("text", text)).strip()
-        previous = dict(envelope.get("previous_request") or {})
+        previous = previous_request.model_dump(mode="json") if previous_request else {}
         request = {
             "product": previous.get("product"),
             "product_id": previous.get("product_id"),
@@ -267,29 +247,19 @@ class ProcurementServices:
         }
 
     def calculate_inventory(
-        self, task: str, query_result: dict[str, Any] | str
+        self,
+        request: ProcurementRequest,
+        query_result: InventoryQuerySuccess | QueryFailure,
+        analysis_strategy: AnalysisStrategy,
+        replan_reason: str | None,
     ) -> dict[str, Any]:
         """Calculate inventory shortage from LLM-provided query rows only."""
 
-        envelope = _payload(task)
-        request = dict(envelope.get("request") or envelope)
-        strategy = str(envelope.get("analysis_strategy") or "standard")
+        request = request.model_dump(mode="json")
+        strategy = str(analysis_strategy.value)
         if request.get("simulate_subagent_failure") and strategy != "fallback_recovery":
             raise RuntimeError("scripted inventory SubAgent failure")
-        required = (
-            "product_id",
-            "sku",
-            "name",
-            "current_qty",
-            "locked_qty",
-            "in_transit_qty",
-            "safety_stock",
-            "updated_at",
-            "average_monthly_consumption",
-        )
-        records, evidence, error = _consume_query_result(
-            "inventory_and_consumption", query_result, required
-        )
+        records, evidence, error = _consume_query_result("inventory_and_consumption", query_result)
         if error:
             return {
                 "subtask": "inventory_analysis",
@@ -298,7 +268,7 @@ class ProcurementServices:
                 "conclusion": "库存数据不可用",
                 "status": "error",
                 "analysis_strategy": strategy,
-                "replan_reason": envelope.get("replan_reason"),
+                "replan_reason": replan_reason,
                 "error": error,
             }
         if len(records) != 1:
@@ -309,7 +279,7 @@ class ProcurementServices:
                 "conclusion": "库存查询必须且只能返回目标产品一行",
                 "status": "error",
                 "analysis_strategy": strategy,
-                "replan_reason": envelope.get("replan_reason"),
+                "replan_reason": replan_reason,
                 "error": {
                     "type": "result_contract_violation",
                     "message": f"库存查询返回 {len(records)} 行",
@@ -352,19 +322,23 @@ class ProcurementServices:
             "conclusion": conclusion,
             "status": "success",
             "analysis_strategy": strategy,
-            "replan_reason": envelope.get("replan_reason"),
+            "replan_reason": replan_reason,
             "fallback_basis": fallback_basis,
         }
 
     def calculate_suppliers(
-        self, task: str, query_result: dict[str, Any] | str
+        self,
+        request: ProcurementRequest,
+        inventory_analysis: InventoryAnalysis,
+        query_result: SupplierQuerySuccess | QueryFailure,
+        analysis_strategy: AnalysisStrategy,
+        replan_reason: str | None,
     ) -> dict[str, Any]:
         """Screen supplier rows without generating or executing SQL."""
 
-        envelope = _payload(task)
-        request = dict(envelope.get("request") or {})
-        inventory = dict(envelope.get("inventory_analysis") or {})
-        strategy = str(envelope.get("analysis_strategy") or "balanced")
+        request = request.model_dump(mode="json")
+        inventory = inventory_analysis.model_dump(mode="json")
+        strategy = str(analysis_strategy.value)
         if (
             request.get("simulate_subagent_failure") == "supplier"
             and strategy != "fallback_recovery"
@@ -373,24 +347,6 @@ class ProcurementServices:
         records, evidence, error = _consume_query_result(
             "supplier_capability_and_history",
             query_result,
-            (
-                "supplier_id",
-                "code",
-                "name",
-                "status",
-                "cooperation_status",
-                "risk_level",
-                "min_order_qty",
-                "max_capacity",
-                "standard_lead_days",
-                "unit_price",
-                "available_qty",
-                "lead_time_days",
-                "quality_pass_rate",
-                "on_time_rate",
-                "severe_incidents",
-                "average_delay_days",
-            ),
         )
         if error:
             return {
@@ -400,7 +356,7 @@ class ProcurementServices:
                 "conclusion": "供应商数据不可用",
                 "status": "error",
                 "analysis_strategy": strategy,
-                "replan_reason": envelope.get("replan_reason"),
+                "replan_reason": replan_reason,
                 "error": error,
             }
         excluded = set(request.get("excluded_suppliers") or [])
@@ -450,38 +406,32 @@ class ProcurementServices:
             "conclusion": conclusion,
             "status": "success" if candidates else "error",
             "analysis_strategy": strategy,
-            "replan_reason": envelope.get("replan_reason"),
+            "replan_reason": replan_reason,
+            "external_status": {},
+            "mcp_status": "not_checked",
+            "warnings": [],
         }
 
     def calculate_pricing(
-        self, task: str, query_result: dict[str, Any] | str
+        self,
+        request: ProcurementRequest,
+        inventory_analysis: InventoryAnalysis,
+        supplier_analysis: SupplierAnalysis,
+        query_result: PricingQuerySuccess | QueryFailure,
+        analysis_strategy: AnalysisStrategy,
+        replan_reason: str | None,
     ) -> dict[str, Any]:
         """Build price plans from contract-shaped query rows."""
 
-        envelope = _payload(task)
-        request = dict(envelope.get("request") or {})
-        inventory = dict(envelope.get("inventory_analysis") or {})
-        supplier_analysis = dict(envelope.get("supplier_analysis") or {})
-        strategy = str(envelope.get("analysis_strategy") or "balanced")
+        request = request.model_dump(mode="json")
+        inventory = inventory_analysis.model_dump(mode="json")
+        supplier_analysis = supplier_analysis.model_dump(mode="json")
+        strategy = str(analysis_strategy.value)
         candidates = list(supplier_analysis.get("candidate_suppliers") or [])
         qty = int(inventory.get("recommended_purchase_quantity") or request.get("quantity") or 0)
         records, evidence, error = _consume_query_result(
             "current_and_historical_prices",
             query_result,
-            (
-                "supplier_id",
-                "code",
-                "name",
-                "unit_price",
-                "min_qty",
-                "available_qty",
-                "lead_time_days",
-                "quoted_at",
-                "valid_until",
-                "historical_average_price",
-                "historical_min_price",
-                "historical_max_price",
-            ),
         )
         if error:
             return {
@@ -491,7 +441,7 @@ class ProcurementServices:
                 "conclusion": "报价数据不可用",
                 "status": "error",
                 "analysis_strategy": strategy,
-                "replan_reason": envelope.get("replan_reason"),
+                "replan_reason": replan_reason,
                 "error": error,
             }
         candidate_codes = {item.get("code") for item in candidates}
@@ -714,31 +664,25 @@ class ProcurementServices:
             "conclusion": conclusion,
             "status": "success" if plans else "error",
             "analysis_strategy": strategy,
-            "replan_reason": envelope.get("replan_reason"),
+            "replan_reason": replan_reason,
         }
 
     def calculate_budget(
-        self, task: str, query_result: dict[str, Any] | str
+        self,
+        request: ProcurementRequest,
+        pricing_analysis: PricingAnalysis,
+        query_result: BudgetQuerySuccess | QueryFailure,
+        analysis_strategy: AnalysisStrategy,
+        replan_reason: str | None,
     ) -> dict[str, Any]:
         """Calculate budget availability from LLM-provided rows."""
 
-        envelope = _payload(task)
-        strategy = str(envelope.get("analysis_strategy") or "standard")
-        request = dict(envelope.get("request") or {})
-        pricing = dict(envelope.get("pricing_analysis") or {})
+        strategy = str(analysis_strategy.value)
+        request = request.model_dump(mode="json")
+        pricing = pricing_analysis.model_dump(mode="json")
         records, evidence, error = _consume_query_result(
             "department_budget",
             query_result,
-            (
-                "department_id",
-                "code",
-                "name",
-                "fiscal_year",
-                "total_amount",
-                "used_amount",
-                "approved_pending_amount",
-                "available_amount",
-            ),
         )
         if error:
             return {
@@ -748,7 +692,7 @@ class ProcurementServices:
                 "status": "error",
                 "conclusion": "预算数据不可用",
                 "analysis_strategy": strategy,
-                "replan_reason": envelope.get("replan_reason"),
+                "replan_reason": replan_reason,
                 "error": error,
             }
         if len(records) != 1:
@@ -759,7 +703,7 @@ class ProcurementServices:
                 "status": "error",
                 "conclusion": "预算查询必须且只能返回部门财年一行",
                 "analysis_strategy": strategy,
-                "replan_reason": envelope.get("replan_reason"),
+                "replan_reason": replan_reason,
                 "error": {
                     "type": "result_contract_violation",
                     "message": f"预算查询返回 {len(records)} 行",
@@ -799,36 +743,30 @@ class ProcurementServices:
             "conclusion": conclusion,
             "status": "success",
             "analysis_strategy": strategy,
-            "replan_reason": envelope.get("replan_reason"),
+            "replan_reason": replan_reason,
         }
 
     def calculate_risk(
-        self, task: str, query_result: dict[str, Any] | str
+        self,
+        request: ProcurementRequest,
+        supplier_analysis: SupplierAnalysis,
+        pricing_analysis: PricingAnalysis,
+        budget_analysis: BudgetAnalysis,
+        query_result: RiskQuerySuccess | QueryFailure,
+        analysis_strategy: AnalysisStrategy,
+        replan_reason: str | None,
     ) -> dict[str, Any]:
         """Score plans from query rows and upstream deterministic results."""
 
-        envelope = _payload(task)
-        strategy = str(envelope.get("analysis_strategy") or "standard")
-        request = dict(envelope.get("request") or {})
-        supplier = dict(envelope.get("supplier_analysis") or {})
-        pricing = dict(envelope.get("pricing_analysis") or {})
-        budget = dict(envelope.get("budget_analysis") or {})
+        strategy = str(analysis_strategy.value)
+        request = request.model_dump(mode="json")
+        supplier = supplier_analysis.model_dump(mode="json")
+        pricing = pricing_analysis.model_dump(mode="json")
+        budget = budget_analysis.model_dump(mode="json")
         candidates = {item["code"]: item for item in supplier.get("candidate_suppliers") or []}
         rows, evidence, error = _consume_query_result(
             "supplier_risk_records",
             query_result,
-            (
-                "code",
-                "risk_level",
-                "inspected_lots",
-                "passed_lots",
-                "severe_incidents",
-                "quality_note",
-                "deliveries",
-                "on_time_deliveries",
-                "average_delay_days",
-                "delivery_note",
-            ),
         )
         if error:
             return {
@@ -954,11 +892,16 @@ class ProcurementServices:
             return "supplier_risk_too_high"
         return "insufficient_or_conflicting_data"
 
-    def execute_plan(self, plan_json: str) -> dict[str, Any]:
-        envelope = _payload(plan_json)
-        request = dict(envelope.get("request") or {})
-        plan = dict(envelope.get("recommended_plan") or {})
-        session_id = str(envelope.get("session_id") or "")
+    def execute_plan(
+        self,
+        request: ProcurementRequest,
+        recommended_plan: AssessedPlan,
+        budget_analysis: BudgetAnalysis,
+        session_id: str,
+    ) -> dict[str, Any]:
+        request = request.model_dump(mode="json")
+        plan = recommended_plan.model_dump(mode="json")
+        budget = budget_analysis.model_dump(mode="json")
         if request.get("simulate_execution_failure"):
             return {
                 "status": "failed",
@@ -966,18 +909,6 @@ class ProcurementServices:
                     "type": "scripted_execution_failure",
                     "message": "执行前外部采购系统失败",
                 },
-                "executed_actions": [],
-            }
-        if not session_id:
-            return {
-                "status": "failed",
-                "error": {"type": "missing_session", "message": "执行日志缺少公开 Session ID"},
-                "executed_actions": [],
-            }
-        if not plan or not plan.get("allocations"):
-            return {
-                "status": "failed",
-                "error": {"type": "invalid_plan", "message": "缺少可执行供应商分配"},
                 "executed_actions": [],
             }
         total_cost = float(plan["total_cost"])
@@ -997,9 +928,7 @@ class ProcurementServices:
             {
                 "request_no": request_no,
                 "session_id": session_id,
-                "department_id": envelope.get("budget_analysis", {})
-                .get("department", {})
-                .get("id", 1),
+                "department_id": budget["department"]["id"],
                 "product_id": request.get("product_id"),
                 "requested_qty": request.get("quantity"),
                 "approved_qty": plan.get("quantity"),
@@ -1079,17 +1008,30 @@ class ProcurementServices:
         }
         result: dict[str, BaseTool] = {}
         for name, (function, description) in definitions.items():
+            args_schema, output_schema = TOOL_CONTRACTS[name]
+            output_adapter = TypeAdapter(output_schema)
+
+            def invoke(
+                _function: Any = function,
+                _output_adapter: TypeAdapter[Any] = output_adapter,
+                **arguments: Any,
+            ) -> dict[str, Any]:
+                validated = _output_adapter.validate_python(_function(**arguments))
+                return validated.model_dump(mode="json")
+
             metadata = {
                 "database_toolkit": name == "execute_procurement_plan",
                 "business_domain": "procurement",
                 "deterministic_calculator": name.startswith("calculate_"),
+                "output_schema": output_schema.model_json_schema(),
             }
             if name == "execute_procurement_plan":
                 metadata["database_operation"] = "write"
-            result[name] = StructuredTool.from_function(
-                function,
+            result[name] = StructuredTool(
+                func=invoke,
                 name=name,
                 description=description,
+                args_schema=args_schema,
                 metadata=metadata,
             )
         result["execute_procurement_plan"].metadata.update(

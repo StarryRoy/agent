@@ -151,15 +151,15 @@ def _instructions(role: str, business_today: date) -> str:
         "requirement": "提取产品、数量、预算、交期、质量、优先级和供应商约束；缺失字段必须明确。",
         "inventory": (
             "查询后调用 calculate_inventory 计算可用、在途、安全库存、预测消耗和采购缺口。"
-            "task.analysis_strategy 支持 standard、schema_recovery、fallback_recovery。"
+            "analysis_strategy 支持 standard、schema_recovery、fallback_recovery。"
         ),
         "supplier": (
             "查询后调用 calculate_suppliers 筛选能力、MOQ、交期、合作状态和历史表现，并核验外部实时状态。"
-            "重规划时按 task.analysis_strategy 使用 delivery_first、risk_first 或 fallback_recovery。"
+            "重规划时按 analysis_strategy 使用 delivery_first、risk_first 或 fallback_recovery。"
         ),
         "pricing": (
             "查询后调用 calculate_pricing 比较当前与历史价格，计算单一及组合方案。"
-            "重规划时按 task.analysis_strategy 使用 cost_reduction、delivery_recovery 或"
+            "重规划时按 analysis_strategy 使用 cost_reduction、delivery_recovery 或"
             "risk_diversification，明确条件性方案。"
         ),
         "budget": "查询后调用 calculate_budget 核验部门余额、用户上限和方案预计占用。",
