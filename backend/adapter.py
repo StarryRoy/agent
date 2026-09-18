@@ -62,7 +62,11 @@ class ProcurementAdapter:
         running = session_id in self.tasks
         try:
             result, unfinished = await self._checkpoint_result(session_id)
-            response = self.application._convert(result, count_task=False)
+            response = self.application._convert(
+                result,
+                count_task=False,
+                prefer_state=running and unfinished,
+            )
             view = SessionView.model_validate(public(response.as_dict()))
             if unfinished and result.status != "paused":
                 view.status = "interrupted"

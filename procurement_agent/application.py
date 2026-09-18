@@ -138,7 +138,13 @@ class ProcurementApplication:
         coroutine.close()
         raise RuntimeError("An event loop is already running; use the async application method")
 
-    def _convert(self, result: AgentResult, *, count_task: bool) -> ProcurementResponse:
+    def _convert(
+        self,
+        result: AgentResult,
+        *,
+        count_task: bool,
+        prefer_state: bool = False,
+    ) -> ProcurementResponse:
         trace_id = str((result.metadata or {}).get("trace_id") or "") or None
         if result.status == "paused":
             data = self._proposal_from_state(result.state or {})
@@ -162,9 +168,17 @@ class ProcurementApplication:
                 trace_id=trace_id,
             )
 
-        data = _plain(
-            result.structured_output if result.structured_output is not None else result.output
-        )
+        if prefer_state:
+            # A running checkpoint may still contain the previous turn's final
+            # structured_response.  The persisted procurement State is the
+            # only authoritative source for an in-progress snapshot.
+            data = _plain(self._running_from_state(result.state or {}))
+        else:
+            data = _plain(
+                result.structured_output
+                if result.structured_output is not None
+                else result.output
+            )
         if not isinstance(data, dict):
             data = {"summary": str(data), "warnings": []}
         data["replan_count"] = max(
@@ -179,6 +193,44 @@ class ProcurementApplication:
                 self._successful_tasks += 1
         status = "completed" if result.status == "completed" else "error"
         return ProcurementResponse(status, result.session_id, data, message, (), trace_id)
+
+    @classmethod
+    def _running_from_state(cls, state: Mapping[str, Any]) -> dict[str, Any]:
+        """Project the latest formal business State for live UI snapshots."""
+
+        data = cls._proposal_from_state(state)
+        business_state = state.get("procurement_results")
+        business_state = business_state if isinstance(business_state, Mapping) else {}
+        stage_titles = (
+            ("requirement", "需求分析"),
+            ("inventory_analysis", "库存分析"),
+            ("supplier_analysis", "供应商分析"),
+            ("pricing_analysis", "价格分析"),
+            ("budget_analysis", "预算分析"),
+            ("risk_analysis", "风险分析"),
+            ("execution", "采购执行"),
+        )
+        completed = [title for field, title in stage_titles if field in business_state]
+        if completed:
+            data["summary"] = "已完成：" + "、".join(completed) + "。其余分析正在进行。"
+        else:
+            data["summary"] = "采购分析正在开始，已完成的阶段结果会实时显示在这里。"
+        data["approval_status"] = "not_required"
+        data["execution_status"] = "not_started"
+
+        execution = business_state.get("execution")
+        if isinstance(execution, Mapping):
+            data["executed_actions"] = list(execution.get("executed_actions") or [])
+            data["execution_status"] = str(execution.get("status") or "not_started")
+
+        warnings: list[str] = []
+        for value in business_state.values():
+            if isinstance(value, Mapping):
+                stage_warnings = value.get("warnings")
+                if isinstance(stage_warnings, list):
+                    warnings.extend(str(item) for item in stage_warnings)
+        data["warnings"] = warnings
+        return data
 
     @staticmethod
     def _proposal_from_state(state: Mapping[str, Any]) -> dict[str, Any]:

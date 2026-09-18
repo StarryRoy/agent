@@ -48,10 +48,46 @@ const names = {
 const technicalFields = new Set(['queries', 'query', 'schema_evidence', 'subtask', 'analysis_strategy', 'selected_plan_index']);
 const values = { pending: '等待审批', approved: '已批准', rejected: '已拒绝', success: '成功',
   failed: '失败', blocked: '已阻断', not_required: '无需执行', not_started: '未开始',
-  awaiting_approval: '等待审批', low: '低', medium: '中', high: '高', ordered: '已下单',
+  awaiting_approval: '等待审批', started: '已开始', info: '信息', loaded: '已加载', unloaded: '已卸载',
+  error: '错误', low: '低', medium: '中', high: '高', ordered: '已下单',
+  agent: 'Agent 分析', tool: '工具调用', middleware: '流程检查', database: '数据库查询',
   create_purchase_request: '创建采购申请', create_purchase_orders: '创建采购订单',
   reserve_budget: '预留采购预算', update_purchase_status: '更新采购状态',
   record_approval: '记录审批结果', write_operation_log: '写入操作日志' };
+const agentLabels = {
+  procurement_main_agent: '采购主 Agent', requirement_agent: '需求 Agent',
+  inventory_agent: '库存 Agent', supplier_agent: '供应商 Agent',
+  pricing_agent: '定价 Agent', budget_agent: '预算 Agent',
+  risk_agent: '风险 Agent', execution_agent: '执行 Agent',
+};
+const toolLabels = {
+  parse_requirement: '解析采购需求', calculate_inventory: '计算库存缺口',
+  calculate_suppliers: '筛选供应商', calculate_pricing: '计算价格方案',
+  calculate_budget: '核验预算', calculate_risk: '评估采购风险',
+  execute_procurement_plan: '执行采购方案', execute_query: '查询业务数据',
+  supplier_status: '查询供应商状态', load_skill: '加载业务 Skill',
+  unload_skill: '卸载业务 Skill', agent_harness_structured_response: '整理结构化结果',
+};
+const eventLabels = {
+  operation: '用户操作', 'agent.start': 'Agent 开始', 'agent.end': 'Agent 完成',
+  'subagent.start': '专业 Agent 开始', 'subagent.end': '专业 Agent 完成',
+  'tool.start': '工具开始', 'tool.end': '工具完成', 'model.start': '模型开始分析',
+  'model.end': '模型完成分析', 'middleware.hook': '流程检查', 'skill.load': '加载业务 Skill',
+  'skill.unload': '卸载业务 Skill', 'database.start': '数据库查询开始',
+  'database.end': '数据库查询完成', 'mcp.tool': '外部服务调用', 'plan.replan': '方案重新规划',
+  approval_required: '等待人工审批', plan_update: '计划更新', final: '分析返回',
+  text_delta: '模型输出', operation_error: '执行错误',
+};
+const hookLabels = {
+  before_model: '模型调用前检查', after_model: '模型调用后检查',
+  before_agent: 'Agent 执行前检查', after_agent: 'Agent 执行后检查',
+  before_tool: '工具调用前检查', after_tool: '工具调用后检查',
+};
+const middlewareLabels = {
+  TimeoutMiddleware: '超时控制', CallLimitMiddleware: '调用次数控制',
+  RetryMiddleware: '自动重试', ProcurementContextMiddleware: '业务上下文整理',
+  ProcurementOrchestrationMiddleware: '依赖与一致性校验',
+};
 
 function node(tag, text, className) {
   const el = document.createElement(tag);
@@ -90,6 +126,228 @@ function dataView(value, depth = 0) {
   return dl;
 }
 
+const narrativeTranslations = [
+  [/\bthe procurement plan is ready for approval\b/gi, '采购方案已准备好，等待审批'],
+  [/\bthe procurement plan is waiting for approval\b/gi, '采购方案正在等待审批'],
+  [/\bthe procurement plan was approved\b/gi, '采购方案已批准'],
+  [/\bthe procurement plan was rejected\b/gi, '采购方案已拒绝'],
+  [/\bno feasible procurement plan was found\b/gi, '未找到可行的采购方案'],
+  [/\binventory analysis completed\b/gi, '库存分析已完成'],
+  [/\bsupplier analysis completed\b/gi, '供应商分析已完成'],
+  [/\bpricing analysis completed\b/gi, '定价分析已完成'],
+  [/\bbudget analysis completed\b/gi, '预算分析已完成'],
+  [/\brisk analysis completed\b/gi, '风险分析已完成'],
+  [/\bexecution completed successfully\b/gi, '执行成功完成'],
+  [/\bexecution failed\b/gi, '执行失败'],
+  [/\bplease wait\b/gi, '请等待'],
+  [/\bprocurement plan\b/gi, '采购方案'],
+  [/\bprocurement request\b/gi, '采购申请'],
+  [/\binventory analysis\b/gi, '库存分析'],
+  [/\bpricing analysis\b/gi, '定价分析'],
+  [/\bsupplier risk\b/gi, '供应商风险'],
+  [/\bdelivery deadline\b/gi, '交付期限'],
+  [/\bdelivery date\b/gi, '交付日期'],
+  [/\bapproval required\b/gi, '等待审批'],
+  [/\bwaiting for approval\b/gi, '等待审批'],
+  [/\bno feasible plan\b/gi, '暂无可行方案'],
+  [/\bquery failed\b/gi, '查询失败'],
+  [/\bdata unavailable\b/gi, '数据不可用'],
+  [/\bsupplier\b/gi, '供应商'],
+  [/\binventory\b/gi, '库存'],
+  [/\bpricing\b/gi, '定价'],
+  [/\bcost\b/gi, '成本'],
+  [/\bbudget\b/gi, '预算'],
+  [/\bdelivery\b/gi, '交付'],
+  [/\bstatus\b/gi, '状态'],
+  [/\bsuccess\b/gi, '成功'],
+  [/\bfailed\b/gi, '失败'],
+];
+
+function localizeNarrative(text) {
+  return narrativeTranslations.reduce((result, [pattern, replacement]) => (
+    result.replace(pattern, replacement)
+  ), String(text));
+}
+
+function inlineMarkdown(text) {
+  const fragment = document.createDocumentFragment();
+  const pattern = /(\*\*|__)(.+?)\1/g;
+  let cursor = 0;
+  let match;
+  const appendText = value => {
+    if (value) fragment.append(document.createTextNode(localizeNarrative(value)));
+  };
+  while ((match = pattern.exec(String(text))) !== null) {
+    appendText(String(text).slice(cursor, match.index));
+    const strong = node('strong');
+    strong.textContent = localizeNarrative(match[2]);
+    fragment.append(strong);
+    cursor = match.index + match[0].length;
+  }
+  appendText(String(text).slice(cursor));
+  return fragment;
+}
+
+// Render the user-facing narrative without injecting HTML. Technical JSON remains untouched below.
+function renderMarkdown(value, className = 'markdown-content') {
+  const container = node('div', undefined, className);
+  const lines = String(value ?? '').replace(/\r\n?/g, '\n').split('\n');
+  let paragraph = [];
+  let list = null;
+  let listType = null;
+
+  const flushParagraph = () => {
+    if (!paragraph.length) return;
+    const content = node('p');
+    paragraph.forEach((line, index) => {
+      if (index) content.append(document.createElement('br'));
+      content.append(inlineMarkdown(line));
+    });
+    container.append(content);
+    paragraph = [];
+  };
+  const closeList = () => {
+    if (list) container.append(list);
+    list = null;
+    listType = null;
+  };
+
+  lines.forEach(line => {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      flushParagraph();
+      closeList();
+      return;
+    }
+    const heading = trimmed.match(/^(#{1,6})\s+(.+)$/);
+    if (heading) {
+      flushParagraph();
+      closeList();
+      const headingNode = node(heading[1].length <= 2 ? 'h4' : 'h5');
+      headingNode.append(inlineMarkdown(heading[2]));
+      container.append(headingNode);
+      return;
+    }
+    const unordered = trimmed.match(/^[-*+]\s+(.+)$/);
+    const ordered = trimmed.match(/^\d+[.)]\s+(.+)$/);
+    if (unordered || ordered) {
+      flushParagraph();
+      const nextType = unordered ? 'ul' : 'ol';
+      if (listType !== nextType) closeList();
+      if (!list) {
+        list = node(nextType);
+        listType = nextType;
+      }
+      const item = node('li');
+      item.append(inlineMarkdown((unordered || ordered)[1]));
+      list.append(item);
+      return;
+    }
+    closeList();
+    paragraph.push(line);
+  });
+  flushParagraph();
+  closeList();
+  return container;
+}
+
+function resultGroup(title, content, className = '') {
+  const group = node('section', undefined, `result-group ${className}`.trim());
+  group.append(node('h4', title));
+  group.append(content);
+  return group;
+}
+
+function statusTile(label, value) {
+  const tile = node('div', undefined, 'result-status');
+  tile.append(node('span', label));
+  tile.append(node('strong', values[value] || value || '暂无'));
+  return tile;
+}
+
+function renderFinalResult(data, next) {
+  const result = node('div', undefined, 'result-layout');
+  const conclusion = node('section', undefined, 'result-conclusion');
+  conclusion.append(node('p', '处理结论', 'result-kicker'));
+  conclusion.append(renderMarkdown(data.summary || next.message || '采购结果已更新。', 'markdown-content result-summary'));
+  result.append(conclusion);
+
+  const statuses = node('div', undefined, 'result-status-grid');
+  statuses.append(
+    statusTile('审批状态', data.approval_status),
+    statusTile('执行状态', data.execution_status),
+  );
+  result.append(statuses);
+
+  const notices = [];
+  if (data.missing_fields?.length) notices.push(['待补充信息', data.missing_fields, 'notice']);
+  if (data.warnings?.length) notices.push(['提示信息', data.warnings, 'notice']);
+  if (notices.length) {
+    const noticeList = node('div', undefined, 'result-notices');
+    notices.forEach(([title, value, className]) => {
+      const notice = node('div', undefined, `notice ${className}`);
+      notice.append(node('strong', title), dataView(value));
+      noticeList.append(notice);
+    });
+    result.append(resultGroup('提示信息', noticeList));
+  }
+
+  const actions = data.executed_actions || [];
+  result.append(resultGroup(
+    '执行记录',
+    actions.length ? dataView(actions) : node('p', '当前没有采购写入记录。', 'muted'),
+    'result-actions',
+  ));
+  return result;
+}
+
+function eventContext(event) {
+  const payload = event.data || event.metadata || {};
+  const inner = payload.data || payload.metadata || payload;
+  const type = event.event_type === 'trace' ? payload.event_type : event.event_type;
+  return { payload, inner, type };
+}
+
+function technicalLabel(container, label, identifier, className = '') {
+  const wrapper = node('span', undefined, `technical-label ${className}`.trim());
+  wrapper.append(node('span', label));
+  if (identifier && identifier !== label) wrapper.append(node('code', identifier));
+  container.append(wrapper);
+}
+
+function eventDetails(event, payload, inner, type) {
+  const details = node('div', undefined, 'event-details');
+  const facts = node('dl', undefined, 'event-facts');
+  const fact = (label, value) => {
+    if (value === undefined || value === null || value === '') return;
+    const row = node('div', undefined, 'event-fact');
+    row.append(node('dt', label), node('dd', values[value] || String(value)));
+    facts.append(row);
+  };
+  fact('状态', event.status || payload.status || inner.status);
+  fact('处理阶段', hookLabels[inner.hook] || inner.hook);
+  fact('调用目的', values[inner.purpose] || inner.purpose);
+  if (event.duration_ms !== undefined && event.duration_ms !== null) {
+    fact('耗时', `${Number(event.duration_ms).toLocaleString('zh-CN', { maximumFractionDigits: 0 })} ms`);
+  }
+  if (inner.result_status) fact('结果状态', inner.result_status);
+  if (facts.children.length) details.append(facts);
+
+  const message = inner.message || payload.message || inner.content || payload.content;
+  if (typeof message === 'string' && message.trim()) {
+    details.append(renderMarkdown(message, 'markdown-content event-message'));
+  }
+  if (event.error || payload.error || inner.error) {
+    details.append(node('p', localizeNarrative(String(event.error || payload.error || inner.error)), 'event-error'));
+  }
+
+  const raw = node('details', undefined, 'event-raw');
+  raw.append(node('summary', '查看原始事件（技术信息）'));
+  raw.append(node('pre', JSON.stringify(event, null, 2)));
+  details.append(raw);
+  return details;
+}
+
 function error(message = '') { $('error').hidden = !message; $('error').textContent = message; }
 function controls() {
   const running = busy || view?.status === 'running';
@@ -111,7 +369,8 @@ function render(next) {
   const data = next.data || {};
   $('summary').className = 'summary-content';
   $('summary').replaceChildren();
-  $('summary').append(node('h3', data.summary || next.message));
+  $('summary').append(node('p', '当前结论', 'result-kicker'));
+  $('summary').append(renderMarkdown(data.summary || next.message || '采购结果已更新。', 'markdown-content summary-narrative'));
   if (data.request && Object.keys(data.request).length) {
     const selected = Object.fromEntries(['product', 'quantity', 'budget', 'department_code',
       'expected_delivery_date', 'latest_delivery_date', 'excluded_suppliers'].filter(key => {
@@ -135,11 +394,19 @@ function render(next) {
   $('analysis-grid').replaceChildren();
   sections.forEach(([key, title]) => {
     const card = node('section', undefined, `card analysis-card ${key === 'recommended_plan' ? 'recommended' : ''}`);
-    card.append(node('h2', title));
+    const heading = node('div', undefined, 'analysis-card-heading');
+    heading.append(node('h2', title));
+    if (data[key]?.status) {
+      const status = String(data[key].status);
+      heading.append(node('span', values[status] || status, `analysis-status status-${status.replace(/[^a-z0-9_-]/gi, '-')}`));
+    }
+    card.append(heading);
     if (key === 'recommended_plan') card.append(dataView(data[key]));
     else {
       const details = node('details');
-      if (data[key]?.conclusion) card.append(node('p', data[key].conclusion, 'muted'));
+      if (data[key]?.conclusion) {
+        card.append(renderMarkdown(data[key].conclusion, 'markdown-content analysis-conclusion'));
+      }
       details.append(node('summary', '查看结构化分析'), dataView(data[key])); card.append(details);
     }
     $('analysis-grid').append(card);
@@ -148,11 +415,7 @@ function render(next) {
     ? '方案已就绪，尚未执行。批准后将恢复 Agent 并创建采购记录；修改将使原审批方案失效。'
     : next.status === 'running' ? 'Agent 正在执行，操作按钮暂时锁定。'
     : `审批状态：${values[data.approval_status] || data.approval_status || '暂无'}。可在下方补充或修改需求。`;
-  $('result').replaceChildren(dataView({
-    execution_status: data.execution_status || 'not_started',
-    approval_status: data.approval_status || 'not_required',
-    executed_actions: data.executed_actions || [],
-  }));
+  $('result').replaceChildren(renderFinalResult(data, next));
   const active = next.status === 'running' ? 1 : next.status === 'approval_required' ? 2 : 3;
   [...$('flow').children].forEach((el, i) => el.classList.toggle('active', i === active));
   controls();
@@ -164,19 +427,28 @@ function addEvent(event) {
   if (id) eventIds.add(id);
   if (!timelineCount) $('timeline').replaceChildren();
   timelineCount++;
-  const payload = event.data || event.metadata || {};
-  const inner = payload.data || payload.metadata || payload;
-  const type = event.event_type === 'trace' ? payload.event_type : event.event_type;
-  const labels = { operation: '用户操作', tool_start: '工具开始', tool_end: '工具完成',
-    subagent_start: '专业 Agent 开始', subagent_end: '专业 Agent 完成',
-    approval_required: '等待人工审批', plan_update: '计划更新', final: '分析返回',
-    text_delta: '模型输出', operation_error: '执行错误' };
+  const { payload, inner, type } = eventContext(event);
+  const label = eventLabels[type] || eventLabels[String(type || '').replace(/_/g, '.')] || '执行事件';
   const item = node('li');
   item.append(node('time', new Date(event.timestamp || Date.now()).toLocaleTimeString('zh-CN', { hour12: false })));
-  item.append(node('strong', labels[type] || type || '执行事件'));
-  const info = inner.name || payload.agent_name || inner.operation || inner.message || '';
-  if (info) item.append(node('span', info, 'event-detail'));
-  const details = node('details'); details.append(node('summary', '事件详情'), node('pre', JSON.stringify(event, null, 2))); item.append(details);
+  item.append(node('strong', label));
+
+  const info = node('div', undefined, 'event-detail');
+  const agent = event.agent_name || payload.agent_name || inner.agent_name;
+  const target = inner.name || inner.operation || inner.tool_name;
+  if (agent) technicalLabel(info, agentLabels[agent] || 'Agent', agent, 'event-agent');
+  if (target && target !== agent) {
+    if (info.children.length) info.append(node('span', ' · ', 'event-separator'));
+    technicalLabel(
+      info,
+      toolLabels[target] || agentLabels[target] || middlewareLabels[target] || target,
+      target,
+      'event-target',
+    );
+  }
+  if (!info.children.length && inner.message) info.append(node('span', inner.message));
+  if (info.children.length) item.append(info);
+  item.append(eventDetails(event, payload, inner, type));
   $('timeline').append(item);
   while ($('timeline').children.length > 120) $('timeline').firstChild.remove();
   $('event-count').textContent = timelineCount;
