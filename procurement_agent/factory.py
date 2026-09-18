@@ -22,6 +22,7 @@ from agent_harness import (
 )
 from langchain_core.language_models import BaseChatModel
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 
 from .application import ProcurementApplication
 from .context import ProcurementContextMiddleware
@@ -38,6 +39,13 @@ from .sql_catalog import role_database_context
 _MCP_TOOL_CACHE: list[Any] | None = None
 GEMINI_MODEL_NAME = "gemini-3.5-flash-lite"
 GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
+GLM_MODEL_NAME = "glm-4.7-flash"
+GLM_API_KEY_ENV = "GLM_API_KEY"
+GLM_BASE_URL = "https://open.bigmodel.cn/api/paas/v4/"
+DEEPSEEK_MODEL_NAME = "deepseek-flash"
+DEEPSEEK_API_KEY_ENV = "DEEPSEEK_API_KEY"
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+MODEL_PROVIDER_ENV = "PROCUREMENT_MODEL_PROVIDER"
 AGENT_ROLES = (
     "requirement",
     "inventory",
@@ -68,6 +76,48 @@ def _create_gemini_model() -> ChatGoogleGenerativeAI:
     if getattr(model, "model", None) == GEMINI_MODEL_NAME and hasattr(model, "n"):
         model.n = None
     return model
+
+
+def _create_glm_model() -> ChatOpenAI:
+    api_key = os.getenv(GLM_API_KEY_ENV)
+    if not api_key:
+        raise RuntimeError(
+            f"GLM real mode requires the {GLM_API_KEY_ENV} environment variable. "
+            "Set it before starting the application."
+        )
+    return ChatOpenAI(
+        model=GLM_MODEL_NAME,
+        api_key=api_key,
+        base_url=GLM_BASE_URL,
+    )
+
+
+def _create_deepseek_model() -> ChatOpenAI:
+    api_key = os.getenv(DEEPSEEK_API_KEY_ENV)
+    if not api_key:
+        raise RuntimeError(
+            f"DeepSeek real mode requires the {DEEPSEEK_API_KEY_ENV} environment variable. "
+            "Set it before starting the application."
+        )
+    return ChatOpenAI(
+        model=DEEPSEEK_MODEL_NAME,
+        api_key=api_key,
+        base_url=DEEPSEEK_BASE_URL,
+    )
+
+
+def _create_default_model() -> BaseChatModel:
+    provider = os.getenv(MODEL_PROVIDER_ENV, "glm").strip().lower()
+    if provider not in {"deepseek", "gemini", "glm"}:
+        raise RuntimeError(
+            f"Unsupported {MODEL_PROVIDER_ENV}={provider!r}; "
+            "expected 'deepseek', 'gemini', or 'glm'."
+        )
+    if provider == "deepseek":
+        return _create_deepseek_model()
+    if provider == "gemini":
+        return _create_gemini_model()
+    return _create_glm_model()
 
 
 async def _supplier_mcp_tools() -> list[Any]:
@@ -131,9 +181,9 @@ async def create_procurement_app_async(
 ) -> ProcurementApplication:
     """Create the application.
 
-    Real mode defaults to one application-owned Gemini model. Explicit ``model``
-    and ``role_models`` values override that default. The deterministic model is
-    an explicit test double and never creates or calls Gemini.
+    Real mode defaults to one application-owned Gemini or GLM model selected from
+    environment configuration. Explicit ``model`` and ``role_models`` values
+    override that default. The deterministic model is an explicit test double.
     """
 
     if deterministic and (model is not None or role_models):
@@ -146,7 +196,7 @@ async def create_procurement_app_async(
         and default_model is None
         and any(role not in configured_roles for role in AGENT_ROLES)
     ):
-        default_model = _create_gemini_model()
+        default_model = _create_default_model()
 
     root = Path(data_dir).resolve() if data_dir else Path(__file__).resolve().parents[1] / "data"
     root.mkdir(parents=True, exist_ok=True)

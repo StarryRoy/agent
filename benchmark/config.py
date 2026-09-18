@@ -9,7 +9,15 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
-from procurement_agent.factory import GEMINI_API_KEY_ENV, GEMINI_MODEL_NAME
+from procurement_agent.factory import (
+    DEEPSEEK_API_KEY_ENV,
+    DEEPSEEK_MODEL_NAME,
+    GEMINI_API_KEY_ENV,
+    GEMINI_MODEL_NAME,
+    GLM_API_KEY_ENV,
+    GLM_MODEL_NAME,
+    MODEL_PROVIDER_ENV,
+)
 
 ROOT = Path(__file__).resolve().parent
 RESULTS_DIR = ROOT / "results"
@@ -43,9 +51,16 @@ class BenchmarkConfig:
     def model_label(self) -> str:
         if self.deterministic:
             return "deterministic test double"
-        primary = self.model or (
-            GEMINI_MODEL_NAME if os.getenv(GEMINI_API_KEY_ENV) else "N/A"
-        )
+        provider = os.getenv(MODEL_PROVIDER_ENV, "glm").strip().lower()
+        if provider == "deepseek":
+            default_name = DEEPSEEK_MODEL_NAME
+        elif provider == "glm":
+            default_name = GLM_MODEL_NAME
+        elif provider == "gemini":
+            default_name = GEMINI_MODEL_NAME
+        else:
+            default_name = "N/A"
+        primary = self.model or default_name
         if not self.role_models:
             return primary
         roles = ", ".join(f"{key}={value}" for key, value in sorted(self.role_models.items()))
@@ -111,10 +126,18 @@ def load_config(argv: list[str] | None = None) -> BenchmarkConfig:
         compare_before=args.compare_before,
         compare_after=args.compare_after,
     )
-    has_primary = bool(config.model or os.getenv(GEMINI_API_KEY_ENV))
+    provider = os.getenv(MODEL_PROVIDER_ENV, "glm").strip().lower()
+    provider_keys = {
+        "deepseek": DEEPSEEK_API_KEY_ENV,
+        "gemini": GEMINI_API_KEY_ENV,
+        "glm": GLM_API_KEY_ENV,
+    }
+    if provider not in provider_keys:
+        parser.error(f"{MODEL_PROVIDER_ENV} must be 'deepseek', 'gemini', or 'glm'")
+    key_name = provider_keys[provider]
+    provider_has_key = os.getenv(key_name)
+    has_primary = bool(config.model or provider_has_key)
     has_all_roles = MODEL_ROLES.issubset(config.role_models)
     if not config.deterministic and not (has_primary or has_all_roles):
-        parser.error(
-            f"set {GEMINI_API_KEY_ENV}, pass --model, or configure every role model"
-        )
+        parser.error(f"set {key_name}, pass --model, or configure every role model")
     return config

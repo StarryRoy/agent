@@ -1,5 +1,6 @@
 -e D:/Project/harness
 langchain-google-genai>=4,<5
+langchain-openai>=0.3,<2
 langgraph-checkpoint-sqlite>=3,<4
 langchain-mcp-adapters>=0.1,<1
 pydantic>=2.7,<3

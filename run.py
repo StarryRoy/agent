@@ -1,8 +1,8 @@
 """One-click launcher for the procurement web demo.
 
-Run ``python run.py`` from the project root.  The small Tk window chooses
-between the existing deterministic model and the application-owned Gemini
-model, then starts the API and static frontend in child processes.
+Run ``python run.py`` from the project root. The small Tk window chooses the
+deterministic model, Gemini, GLM, or DeepSeek, then starts the API and static
+frontend in child processes.
 """
 
 from __future__ import annotations
@@ -109,11 +109,11 @@ class WindowsKillJob:
             self._handle = None
 
 
-def choose_mode() -> bool:
-    """Return True for demo mode, using a minimal native selection window."""
+def choose_mode() -> str:
+    """Return the selected demo or real-model mode."""
     import tkinter as tk
 
-    choice: list[bool] = []
+    choice: list[str] = []
     window = tk.Tk()
     window.title("企业采购 Agent")
     window.resizable(False, False)
@@ -121,16 +121,34 @@ def choose_mode() -> bool:
     buttons = tk.Frame(window, padx=16, pady=8)
     buttons.pack()
 
-    def select(demo: bool) -> None:
-        choice.append(demo)
+    def select(mode: str) -> None:
+        choice.append(mode)
         window.destroy()
 
-    tk.Button(buttons, text="Demo 模式（无需 API Key）", width=25, command=lambda: select(True)).pack(
-        pady=4
-    )
-    tk.Button(buttons, text="Real 模式（Gemini）", width=25, command=lambda: select(False)).pack(
-        pady=4
-    )
+    tk.Button(
+        buttons,
+        text="Demo 模式（无需 API Key）",
+        width=25,
+        command=lambda: select("demo"),
+    ).pack(pady=4)
+    tk.Button(
+        buttons,
+        text="Real 模式（Gemini）",
+        width=25,
+        command=lambda: select("gemini"),
+    ).pack(pady=4)
+    tk.Button(
+        buttons,
+        text="Real 模式（GLM-4.7-Flash）",
+        width=25,
+        command=lambda: select("glm"),
+    ).pack(pady=4)
+    tk.Button(
+        buttons,
+        text="Real 模式（DeepSeek V4 Flash）",
+        width=25,
+        command=lambda: select("deepseek"),
+    ).pack(pady=4)
     window.protocol("WM_DELETE_WINDOW", window.destroy)
     window.mainloop()
     if not choice:
@@ -166,14 +184,22 @@ def stop_processes(processes: list[subprocess.Popen]) -> None:
 
 
 def main() -> int:
-    demo = choose_mode()
+    mode = choose_mode()
+    demo = mode == "demo"
     environment = os.environ.copy()
     if demo:
         environment["PROCUREMENT_DEMO"] = "1"
+        environment.pop("PROCUREMENT_MODEL_PROVIDER", None)
     else:
         environment.pop("PROCUREMENT_DEMO", None)
-        if not environment.get("GEMINI_API_KEY"):
-            raise SystemExit("Real 模式需要先设置 GEMINI_API_KEY 环境变量。")
+        environment["PROCUREMENT_MODEL_PROVIDER"] = mode
+        key_name = {
+            "deepseek": "DEEPSEEK_API_KEY",
+            "gemini": "GEMINI_API_KEY",
+            "glm": "GLM_API_KEY",
+        }[mode]
+        if not environment.get(key_name):
+            raise SystemExit(f"{mode.upper()} Real 模式需要先设置 {key_name} 环境变量。")
 
     processes: list[subprocess.Popen] = []
     kill_job = WindowsKillJob()
@@ -194,7 +220,7 @@ def main() -> int:
         kill_job.assign(frontend)
         wait_for_backend(backend)
         url = f"http://127.0.0.1:{FRONTEND_PORT}/"
-        print(f"已启动 {'Demo' if demo else 'Real'} 模式：{url}")
+        print(f"已启动 {mode} 模式：{url}")
         webbrowser.open(url)
         print("按 Ctrl+C 可停止前后端服务。")
         while True:
