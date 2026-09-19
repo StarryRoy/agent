@@ -318,3 +318,7 @@ Retry、Replan、HITL、总耗时、阶段耗时、Token 使用量和错误率�
 异常场景使用 JSON 包装的确定性注入字段：`simulate_sql_failure`、
 `simulate_subagent_failure`、`simulate_mcp_failure` 和 `simulate_execution_failure`。这些字段只为
 离线回归测试服务，正常自然语言入口无需使用。
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
