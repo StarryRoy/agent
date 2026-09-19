@@ -144,6 +144,13 @@ class BudgetRow(ContractModel):
     available_amount: NonNegativeFloat = Field(..., description="可用预算。")
 
 
+class BudgetPlanCheck(ContractModel):
+    plan_id: NonEmpty = Field(..., description="待校验的价格方案编号。")
+    total_cost: NonNegativeFloat = Field(..., description="该价格方案总金额。")
+    within_budget: bool = Field(..., description="该价格方案是否通过有效预算校验。")
+    over_budget_amount: NonNegativeFloat = Field(..., description="该价格方案超出有效预算金额。")
+
+
 class RiskRow(ContractModel):
     code: NonEmpty = Field(..., description="供应商编码。")
     risk_level: Literal["low", "medium", "high", "critical"] = Field(
@@ -477,6 +484,9 @@ class BudgetAnalysis(ContractModel):
     user_budget: float | None = Field(..., ge=0, description="用户预算上限。")
     effective_available_budget: NonNegativeFloat = Field(..., description="有效可用预算。")
     estimated_occupation: NonNegativeFloat = Field(..., description="预计占用。")
+    plan_budget_checks: list[BudgetPlanCheck] = Field(
+        ..., description="Pricing 每个候选方案的逐方案预算校验结果。"
+    )
     within_budget: bool = Field(..., description="是否在预算内。")
     over_budget_amount: NonNegativeFloat = Field(..., description="超预算金额。")
     adjustment_room: NonNegativeFloat = Field(..., description="预算余量。")

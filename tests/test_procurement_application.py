@@ -76,11 +76,19 @@ def test_full_flow_pauses_then_executes_after_approval(app):
     assert proposal.status == "approval_required"
     assert proposal.data["inventory_analysis"]["recommended_purchase_quantity"] == 445
     assert len(proposal.data["recommended_plan"]["allocations"]) == 2
+    budget = proposal.data["budget_analysis"]
+    minimum_cost = min(
+        plan["total_cost"] for plan in proposal.data["pricing_analysis"]["plans"]
+    )
+    assert budget["minimum_cost_plan_occupation"] == minimum_cost
+    assert budget["recommended_plan_occupation"] == proposal.data["recommended_plan"]["total_cost"]
+    assert budget["display_occupation"] == budget["recommended_plan_occupation"]
 
     executed = app.approve("full-flow")
     assert executed.status == "completed"
     assert executed.data["approval_status"] == "approved"
     assert executed.data["execution_status"] == "success"
+    assert executed.data["budget_analysis"]["display_occupation"] == executed.data["recommended_plan"]["total_cost"]
     assert any(action["action"] == "reserve_budget" for action in executed.data["executed_actions"])
     assert len(_inserted_rows(app, "purchase_requests")) == 1
     assert len(_inserted_rows(app, "purchase_orders")) == 2

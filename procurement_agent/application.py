@@ -147,7 +147,7 @@ class ProcurementApplication:
     ) -> ProcurementResponse:
         trace_id = str((result.metadata or {}).get("trace_id") or "") or None
         if result.status == "paused":
-            data = self._proposal_from_state(result.state or {})
+            data = self._with_budget_display(self._proposal_from_state(result.state or {}))
             data["replan_count"] = max(
                 int(data.get("replan_count") or 0),
                 self.metric_sink.replan_count_for_trace(trace_id),
@@ -181,6 +181,7 @@ class ProcurementApplication:
             )
         if not isinstance(data, dict):
             data = {"summary": str(data), "warnings": []}
+        data = self._with_budget_display(data)
         data["replan_count"] = max(
             int(data.get("replan_count") or 0),
             self.metric_sink.replan_count_for_trace(trace_id),
@@ -193,6 +194,38 @@ class ProcurementApplication:
                 self._successful_tasks += 1
         status = "completed" if result.status == "completed" else "error"
         return ProcurementResponse(status, result.session_id, data, message, (), trace_id)
+
+    @staticmethod
+    def _with_budget_display(data: Mapping[str, Any]) -> dict[str, Any]:
+        """Add final-response budget amounts without changing formal business State."""
+
+        projected = dict(data)
+        budget = projected.get("budget_analysis")
+        if not isinstance(budget, Mapping):
+            return projected
+        minimum_cost = budget.get("estimated_occupation")
+        if minimum_cost is None:
+            return projected
+
+        recommended = projected.get("recommended_plan")
+        if not isinstance(recommended, Mapping):
+            risk = projected.get("risk_analysis")
+            recommended = risk.get("recommended_plan") if isinstance(risk, Mapping) else None
+        recommended_cost = (
+            float(recommended["total_cost"])
+            if isinstance(recommended, Mapping) and recommended.get("total_cost") is not None
+            else None
+        )
+        minimum_cost = float(minimum_cost)
+        display_fields = {
+            "display_occupation": recommended_cost
+            if recommended_cost is not None
+            else minimum_cost,
+            "recommended_plan_occupation": recommended_cost,
+            "minimum_cost_plan_occupation": minimum_cost,
+        }
+        projected["budget_analysis"] = {**display_fields, **dict(budget)}
+        return projected
 
     @classmethod
     def _running_from_state(cls, state: Mapping[str, Any]) -> dict[str, Any]:

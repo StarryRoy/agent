@@ -300,6 +300,11 @@ def test_complete_chain_passes_deterministic_business_consistency_validation():
         }
     )
     state["budget_analysis"] = validate_business_result("budget_agent", budget, state)
+    budget_checks = {
+        check["plan_id"]: check for check in budget["plan_budget_checks"]
+    }
+    assert set(budget_checks) == {plan["plan_id"] for plan in pricing["plans"]}
+    assert all(check["within_budget"] for check in budget_checks.values())
     risk = tools["calculate_risk"].invoke(
         {
             "request": request,
@@ -311,6 +316,54 @@ def test_complete_chain_passes_deterministic_business_consistency_validation():
         }
     )
     state["risk_analysis"] = validate_business_result("risk_agent", risk, state)
+    assert budget_checks[risk["recommended_plan"]["plan_id"]]["within_budget"]
+
+    mixed_budget = copy.deepcopy(budget)
+    mixed_budget["user_budget"] = 650_000.0
+    mixed_budget["effective_available_budget"] = 650_000.0
+    mixed_budget["plan_budget_checks"] = [
+        {
+            "plan_id": plan["plan_id"],
+            "total_cost": plan["total_cost"],
+            "within_budget": float(plan["total_cost"]) <= 650_000,
+            "over_budget_amount": max(float(plan["total_cost"]) - 650_000, 0),
+        }
+        for plan in pricing["plans"]
+    ]
+    mixed_budget["estimated_occupation"] = min(
+        float(plan["total_cost"]) for plan in pricing["plans"]
+    )
+    mixed_budget["within_budget"] = True
+    mixed_budget["over_budget_amount"] = 0.0
+    mixed_budget["adjustment_room"] = 650_000.0 - mixed_budget["estimated_occupation"]
+    mixed_budget["budget_risk"] = "medium"
+    validate_business_result("budget_agent", mixed_budget, state)
+    mixed_risk = tools["calculate_risk"].invoke(
+        {
+            "request": {**request, "budget": 650_000.0},
+            "supplier_analysis": suppliers,
+            "pricing_analysis": pricing,
+            "budget_analysis": mixed_budget,
+            "query_result": _query(fixtures["risk"]["1"]),
+            **common,
+        }
+    )
+    assert mixed_risk["recommended_plan"]["plan_id"] == "PLAN-2"
+    assert {plan["plan_id"] for plan in mixed_risk["not_recommended_plans"]} >= {
+        "PLAN-3",
+        "PLAN-4",
+    }
+    invalid_mixed_risk = copy.deepcopy(mixed_risk)
+    invalid_mixed_risk["recommended_plan"] = next(
+        plan for plan in mixed_risk["not_recommended_plans"] if plan["plan_id"] == "PLAN-3"
+    )
+    with pytest.raises(BusinessConsistencyError, match="未通过预算校验"):
+        validate_business_result(
+            "risk_agent",
+            invalid_mixed_risk,
+            {**state, "budget_analysis": mixed_budget},
+        )
+
     execution_state = copy.deepcopy(state)
     execution_state["budget_analysis"]["remarks"] = ["仅供预算 Agent 展示"]
     strict_arguments = build_execution_arguments(execution_state, "contract-test")

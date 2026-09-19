@@ -737,6 +737,15 @@ class ProcurementServices:
         available = float(row["available_amount"])
         user_budget = request.get("budget")
         effective = min(available, float(user_budget)) if user_budget is not None else available
+        plan_budget_checks = [
+            {
+                "plan_id": plan["plan_id"],
+                "total_cost": float(plan["total_cost"]),
+                "within_budget": float(plan["total_cost"]) <= effective,
+                "over_budget_amount": max(float(plan["total_cost"]) - effective, 0),
+            }
+            for plan in plans
+        ]
         over = max(estimated - effective, 0)
         facts = [
             f"部门可用预算{available:.2f}",
@@ -744,6 +753,7 @@ class ProcurementServices:
             if user_budget is not None
             else "用户未设置单独上限",
             f"最低可行方案预计占用{estimated:.2f}",
+            f"{sum(item['within_budget'] for item in plan_budget_checks)}个价格方案通过预算校验",
         ]
         conclusion = "预算满足" if over == 0 else f"超出有效预算{over:.2f}"
         return {
@@ -757,6 +767,7 @@ class ProcurementServices:
             "user_budget": float(user_budget) if user_budget is not None else None,
             "effective_available_budget": effective,
             "estimated_occupation": estimated,
+            "plan_budget_checks": plan_budget_checks,
             "within_budget": over == 0,
             "over_budget_amount": over,
             "adjustment_room": max(effective - estimated, 0),
@@ -802,6 +813,9 @@ class ProcurementServices:
             }
         records = {row["code"]: row for row in rows}
         effective_budget = float(budget.get("effective_available_budget") or 0)
+        plan_budget_checks = {
+            str(item["plan_id"]): item for item in budget.get("plan_budget_checks") or []
+        }
         assessed: list[dict[str, Any]] = []
         for plan in pricing.get("plans") or []:
             score = 0
@@ -839,9 +853,10 @@ class ProcurementServices:
             if not plan.get("meets_quantity", False):
                 score += 45
                 items.append("供货数量不足")
-            if effective_budget and float(plan["total_cost"]) > effective_budget:
+            budget_check = plan_budget_checks.get(str(plan["plan_id"]))
+            if not budget_check or not budget_check.get("within_budget", False):
                 score += 40
-                items.append("超出有效预算")
+                items.append("未通过逐方案预算校验")
             score = min(score, 100)
             level = (
                 "low"
@@ -861,7 +876,7 @@ class ProcurementServices:
             for item in assessed
             if item.get("meets_quantity")
             and item.get("meets_deadline")
-            and (not effective_budget or float(item["total_cost"]) <= effective_budget)
+            and plan_budget_checks.get(str(item["plan_id"]), {}).get("within_budget", False)
             and item["risk_level"] not in {"critical"}
         ]
         selected_index = request.get("selected_plan_index")

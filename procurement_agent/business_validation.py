@@ -294,6 +294,26 @@ def validate_business_result(
         if not _close(expected, float(result["estimated_occupation"])):
             raise BusinessConsistencyError("预算预计占用与价格方案金额不一致")
         effective = float(result["effective_available_budget"])
+        plan_budget_checks = list(result["plan_budget_checks"])
+        plan_ids = [str(plan["plan_id"]) for plan in plans]
+        check_ids = [str(check["plan_id"]) for check in plan_budget_checks]
+        if (
+            len(check_ids) != len(plan_ids)
+            or len(set(check_ids)) != len(check_ids)
+            or set(check_ids) != set(plan_ids)
+        ):
+            raise BusinessConsistencyError("预算逐方案校验未覆盖全部价格方案")
+        checks_by_id = {str(check["plan_id"]): check for check in plan_budget_checks}
+        for plan in plans:
+            plan_id = str(plan["plan_id"])
+            check = checks_by_id[plan_id]
+            plan_cost = float(plan["total_cost"])
+            if not _close(plan_cost, float(check["total_cost"])):
+                raise BusinessConsistencyError("逐方案预算校验金额与价格方案不一致")
+            if bool(check["within_budget"]) != (plan_cost <= effective):
+                raise BusinessConsistencyError("逐方案预算是否充足标志与金额不一致")
+            if not _close(max(plan_cost - effective, 0), float(check["over_budget_amount"])):
+                raise BusinessConsistencyError("逐方案预算超额金额计算不一致")
         occupation = float(result["estimated_occupation"])
         if bool(result["within_budget"]) != (occupation <= effective):
             raise BusinessConsistencyError("预算是否充足标志与金额不一致")
@@ -304,6 +324,10 @@ def validate_business_result(
 
     elif agent_name == "risk_agent":
         pricing_plans = list(state["pricing_analysis"]["plans"])
+        budget_checks = {
+            str(check["plan_id"]): check
+            for check in state["budget_analysis"]["plan_budget_checks"]
+        }
         expected = _purchase_quantity(state)
         assessed = [
             *([result["recommended_plan"]] if result.get("recommended_plan") else []),
@@ -318,6 +342,11 @@ def validate_business_result(
             *([result["recommended_plan"]] if result.get("recommended_plan") else []),
             *result["alternative_plans"],
         ]
+        if any(
+            not budget_checks.get(str(plan["plan_id"]), {}).get("within_budget", False)
+            for plan in feasible
+        ):
+            raise BusinessConsistencyError("风险推荐或备选方案未通过预算校验")
         if any(
             not plan["meets_quantity"] or int(plan["quantity"]) != expected for plan in feasible
         ):
