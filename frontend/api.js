@@ -21,6 +21,7 @@ export const act = (id, action, text) => request(`/sessions/${encodeURIComponent
   method: 'POST', ...(text === undefined ? {} : { body: JSON.stringify({ text }) }),
 });
 export const trace = id => request(`/sessions/${encodeURIComponent(id)}/trace`);
+export const resetData = () => request('/reset', { method: 'POST' });
 
 export function observe(id, callbacks) {
   const stream = new EventSource(`${API_BASE}/api/v1/sessions/${encodeURIComponent(id)}/events`);

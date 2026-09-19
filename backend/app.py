@@ -30,13 +30,20 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(api: FastAPI):
-        application = await create_procurement_app_async(
-            data_dir=root,
-            reset_database=True,
-            deterministic=demo,
-            enable_mcp=mcp,
+        async def create_application():
+            return await create_procurement_app_async(
+                data_dir=root,
+                reset_database=False,
+                deterministic=demo,
+                enable_mcp=mcp,
+            )
+
+        application = await create_application()
+        api.state.adapter = ProcurementAdapter(
+            application,
+            root,
+            recreate_application=create_application,
         )
-        api.state.adapter = ProcurementAdapter(application, root)
         try:
             yield
         finally:
@@ -59,6 +66,11 @@ def create_app(
     @api.get("/api/v1/health")
     async def health():
         return {"status": "ok", "mode": "deterministic_demo" if demo else "configured_model"}
+
+    @api.post("/api/v1/reset")
+    async def reset():
+        await adapter().reset_all()
+        return {"status": "reset", "message": "已清空历史 Session、Checkpoint、Trace 并恢复演示数据。"}
 
     @api.post("/api/v1/sessions", response_model=Accepted, status_code=202)
     async def submit(body: TextInput):

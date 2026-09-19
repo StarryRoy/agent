@@ -111,6 +111,24 @@ def test_checkpoint_query_and_approval_survive_backend_restart(tmp_path):
         assert wait(second, sid)["data"]["execution_status"] == "success"
 
 
+def test_explicit_reset_clears_all_durable_state_and_restores_demo_database(tmp_path):
+    with TestClient(create_app(data_dir=tmp_path, deterministic=True, enable_mcp=False)) as client:
+        sid = submit(client)
+        assert wait(client, sid)["status"] == "approval_required"
+        assert client.post(f"/api/v1/sessions/{sid}/approve").status_code == 202
+        assert wait(client, sid)["data"]["execution_status"] == "success"
+        assert client.get(f"/api/v1/sessions/{sid}/trace").json()["events"]
+        assert inserted_rows(client.app.state.adapter.application, "purchase_requests")
+
+        response = client.post("/api/v1/reset")
+        assert response.status_code == 200
+        assert response.json()["status"] == "reset"
+        assert client.get(f"/api/v1/sessions/{sid}").status_code == 404
+        assert not (tmp_path / "traces.jsonl").exists()
+        assert inserted_rows(client.app.state.adapter.application, "purchase_requests") == []
+        assert client.get("/api/v1/metrics").json()["metrics"]["tasks"] == 0
+
+
 @pytest.mark.parametrize(
     "text, expected",
     [

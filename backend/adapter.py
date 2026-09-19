@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 from collections import deque
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from uuid import uuid4
 from fastapi import HTTPException
 
 from procurement_agent.application import ProcurementApplication
+from procurement_agent.database import initialize_database
 
 from .schemas import SessionView
 
@@ -37,9 +39,18 @@ def public(value: Any) -> Any:
 
 
 class ProcurementAdapter:
-    def __init__(self, application: ProcurementApplication, data_dir: Path):
+    def __init__(
+        self,
+        application: ProcurementApplication,
+        data_dir: Path,
+        *,
+        recreate_application: Callable[[], Awaitable[ProcurementApplication]],
+    ):
         self.application = application
-        self.trace_path = data_dir / "traces.jsonl"
+        self.data_dir = data_dir.resolve()
+        self.trace_path = self.data_dir / "traces.jsonl"
+        self._recreate_application = recreate_application
+        self._resetting = False
         # Only active HTTP operations and bounded replay buffers live in memory.
         # Procurement state is always read from Harness checkpoints.
         self.tasks: dict[str, asyncio.Task] = {}
@@ -123,6 +134,8 @@ class ProcurementAdapter:
         }
 
     async def start(self, operation: str, session_id: str | None = None, text: str = "") -> str:
+        if self._resetting:
+            raise HTTPException(409, "正在重置全部数据，请稍后再试")
         session_id = session_id or f"purchase-{uuid4().hex}"
         if session_id in self.tasks:
             raise HTTPException(409, "该 Session 正在执行，请勿重复提交")
@@ -140,6 +153,41 @@ class ProcurementAdapter:
         self.emit(session_id, "operation", {"operation": operation, "text": text})
         self.tasks[session_id] = asyncio.create_task(self._run(operation, session_id, text))
         return session_id
+
+    async def reset_all(self) -> None:
+        """Reset every durable store and replace the live application resources."""
+
+        if self._resetting:
+            raise HTTPException(409, "正在重置全部数据，请稍后再试")
+        self._resetting = True
+        try:
+            if self.tasks:
+                raise HTTPException(409, "当前仍有 Session 正在执行，请等待完成后再重置")
+            async with self.execution_lock:
+                if self.tasks:
+                    raise HTTPException(409, "当前仍有 Session 正在执行，请等待完成后再重置")
+                self.application.close()
+                self._remove_persistent_file(self.data_dir / "procurement.sqlite")
+                self._remove_persistent_file(self.data_dir / "checkpoints.sqlite")
+                self._remove_persistent_file(self.data_dir / "traces.jsonl")
+                initialize_database(self.data_dir / "procurement.sqlite", reset=False)
+                self.application = await self._recreate_application()
+                self.errors.clear()
+                self.events.clear()
+                self.sequence.clear()
+        finally:
+            self._resetting = False
+
+    @staticmethod
+    def _remove_persistent_file(path: Path) -> None:
+        candidates = [path]
+        if path.suffix == ".sqlite":
+            candidates.extend([Path(f"{path}-wal"), Path(f"{path}-shm")])
+        for candidate in candidates:
+            try:
+                candidate.unlink()
+            except FileNotFoundError:
+                continue
 
     async def _run(self, operation: str, session_id: str, text: str) -> None:
         try:

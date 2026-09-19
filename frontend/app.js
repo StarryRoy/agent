@@ -357,6 +357,7 @@ function controls() {
   $('submit').disabled = running;
   $('restore-id').disabled = running;
   $('restore-form').querySelector('button').disabled = running;
+  $('reset-data').disabled = running;
   $('approve').disabled = running || view?.status !== 'approval_required';
   $('reject').disabled = $('approve').disabled;
   $('modify').disabled = running || !['approval_required', 'completed'].includes(view?.status);
@@ -525,6 +526,18 @@ for (const action of ['approve', 'reject']) $(action).onclick = () => perform(as
 $('modify-form').onsubmit = event => { event.preventDefault(); perform(async () => {
   await api.act(current, 'modify', $('modify-text').value); $('modify-text').value = ''; await load(current, false);
 }); };
+$('reset-data').onclick = () => {
+  if (!window.confirm('确认重置全部数据？这将清空所有历史 Session、Checkpoint、Trace 和业务记录，并恢复初始演示数据。')) return;
+  perform(async () => {
+    await api.resetData();
+    stopStream?.();
+    stopStream = null;
+    current = null;
+    view = null;
+    localStorage.removeItem('procurement.session');
+    window.location.reload();
+  });
+};
 $('refresh-metrics').onclick = () => perform(observability);
 $('docs-link').href = `${api.API_BASE}/docs`;
 async function initialize() {
