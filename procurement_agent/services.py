@@ -152,7 +152,7 @@ class ProcurementServices:
             request["quantity"] = int(quantity_matches[-1].group(1).replace(",", ""))
 
         budget_match = re.search(
-            r"预算(?:可以|可)?\s*(增加|提高|追加|改为|调整为|是|为|到)?\s*"
+            r"预算(?:可以|可)?\s*(上限|限额|增加|提高|追加|改为|调整为|是|为|到)?\s*"
             r"(\d+(?:\.\d+)?)\s*(万|万元|元)?",
             text,
         )
@@ -163,6 +163,16 @@ class ProcurementServices:
                 request["budget"] = float(request["budget"]) + amount
             else:
                 request["budget"] = amount
+
+        department_aliases = {
+            "IT": ("信息技术部", "IT"),
+            "OPS": ("运营部", "OPS"),
+            "RND": ("研发部", "RND"),
+        }
+        for code, aliases in department_aliases.items():
+            if any(alias.casefold() in text.casefold() for alias in aliases):
+                request["department_code"] = code
+                break
 
         absolute_date = re.search(r"(20\d{2})[-年/](\d{1,2})[-月/](\d{1,2})日?", text)
         if absolute_date:
@@ -192,12 +202,24 @@ class ProcurementServices:
 
         if any(word in text for word in ("必须", "紧急", "优先")):
             request["priority"] = "high"
+        if "企业级" in text and "企业级" not in request["quality_requirements"]:
+            request["quality_requirements"].append("企业级")
         if "三年质保" in text and "三年质保" not in request["quality_requirements"]:
             request["quality_requirements"].append("三年质保")
         if "合格率" in text:
-            quality = re.search(r"合格率.*?(\d+(?:\.\d+)?)%", text)
+            quality = re.search(r"合格率.*?(\d+(?:\.\d+)?)\s*%", text)
             if quality:
-                request["quality_requirements"].append(f"批次合格率不低于{quality.group(1)}%")
+                requirement = f"批次合格率不低于{quality.group(1)}%"
+                if requirement not in request["quality_requirements"]:
+                    request["quality_requirements"].append(requirement)
+        if "优先保证按期交付" in text and "优先保证按期交付" not in request["other_constraints"]:
+            request["other_constraints"].append("优先保证按期交付")
+        if "满足数量、质量和预算约束" in text and "满足数量、质量和预算约束" not in request[
+            "other_constraints"
+        ]:
+            request["other_constraints"].append("满足数量、质量和预算约束")
+        if "尽量降低总成本" in text and "尽量降低总成本" not in request["other_constraints"]:
+            request["other_constraints"].append("尽量降低总成本")
 
         supplier_aliases = {
             "SUP-A": ("供应商A", "SUP-A", "华东智造"),

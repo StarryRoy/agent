@@ -133,6 +133,38 @@ def test_requirement_tool_returns_output_validated_by_declared_model():
     assert validated.request.budget == 800000
 
 
+def test_requirement_tool_parses_enterprise_rnd_demo_constraints():
+    result = _tools()["parse_requirement"].invoke(
+        {
+            "text": (
+                "采购500台标准工业平板设备，采购部门为研发部（RND），预算上限80万元，"
+                "最晚2026-10-31交付。要求企业级、三年质保、批次合格率不低于95%。"
+                "优先保证按期交付，在满足数量、质量和预算约束的前提下尽量降低总成本。"
+            ),
+            "previous_request": None,
+        }
+    )
+    request = ProcurementRequest.model_validate(result["request"])
+
+    assert request.product_id == 1
+    assert request.quantity == 500
+    assert request.budget == 800000
+    assert request.expected_delivery_date == "2026-10-31"
+    assert request.latest_delivery_date == "2026-10-31"
+    assert request.department_code == "RND"
+    assert request.quality_requirements == [
+        "企业级",
+        "三年质保",
+        "批次合格率不低于95%",
+    ]
+    assert request.priority == "high"
+    assert request.other_constraints == [
+        "优先保证按期交付",
+        "满足数量、质量和预算约束",
+        "尽量降低总成本",
+    ]
+
+
 def test_fault_injection_is_separate_from_business_request():
     assert not any(name.startswith("simulate_") for name in ProcurementRequest.model_fields)
     config = ProcurementTestConfig.model_validate(_test_config(simulate_sql_failure=True))

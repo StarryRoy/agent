@@ -513,7 +513,7 @@ async function perform(action) {
   finally { busy = false; controls(); }
 }
 
-$('example').onclick = () => { $('request-text').value = '下个月需要采购500台设备，预算80万，月底前必须到货。'; $('request-text').focus(); };
+$('example').onclick = () => { $('request-text').value = '采购500台标准工业平板设备，采购部门为研发部（RND），预算上限80万元，最晚2026-10-31交付。要求企业级、三年质保、批次合格率不低于95%。优先保证按期交付，在满足数量、质量和预算约束的前提下尽量降低总成本。请完成库存、供应商、定价、预算和风险分析，并形成可执行采购方案。'; $('request-text').focus(); };
 $('request-form').onsubmit = event => { event.preventDefault(); perform(async () => {
   const created = await api.submit($('request-text').value); await load(created.session_id);
 }); };

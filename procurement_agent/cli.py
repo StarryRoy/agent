@@ -104,7 +104,10 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "demo":
             session = args.session or f"demo-{uuid.uuid4().hex[:8]}"
             response = app.submit(
-                "下个月需要采购500台设备，预算80万，月底前必须到货，帮我确定最合适的采购方案。",
+                "采购500台标准工业平板设备，采购部门为研发部（RND），预算上限80万元，"
+                "最晚2026-10-31交付。要求企业级、三年质保、批次合格率不低于95%。"
+                "优先保证按期交付，在满足数量、质量和预算约束的前提下尽量降低总成本。"
+                "请完成库存、供应商、定价、预算和风险分析，并形成可执行采购方案。",
                 session_id=session,
             )
             _print(response.as_dict())

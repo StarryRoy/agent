@@ -231,7 +231,7 @@ $env:DEEPSEEK_API_KEY = "your-deepseek-api-key"
 分步操作：
 
 ```powershell
-.\.venv\Scripts\python.exe main.py request "下个月需要采购500台设备，预算80万，月底前必须到货。" --session buy-001
+.\.venv\Scripts\python.exe main.py request "采购500台标准工业平板设备，采购部门为研发部（RND），预算上限80万元，最晚2026-10-31交付。要求企业级、三年质保、批次合格率不低于95%。优先保证按期交付，在满足数量、质量和预算约束的前提下尽量降低总成本。请完成库存、供应商、定价、预算和风险分析，并形成可执行采购方案。" --session buy-001
 .\.venv\Scripts\python.exe main.py approve buy-001
 ```
 
@@ -255,7 +255,7 @@ from procurement_agent import create_procurement_app
 
 with create_procurement_app(data_dir="data") as app:
     proposal = app.submit(
-        "下个月需要采购500台设备，预算80万，月底前必须到货。",
+        "采购500台标准工业平板设备，采购部门为研发部（RND），预算上限80万元，最晚2026-10-31交付。要求企业级、三年质保、批次合格率不低于95%。优先保证按期交付，在满足数量、质量和预算约束的前提下尽量降低总成本。请完成库存、供应商、定价、预算和风险分析，并形成可执行采购方案。",
         session_id="buy-001",
     )
     print(proposal.status)  # approval_required
