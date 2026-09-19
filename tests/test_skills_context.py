@@ -129,7 +129,7 @@ def test_context_uses_persistent_state_and_never_rebuilds_it_from_tool_messages(
     assert "test_config" not in task
 
 
-def test_format_request_ends_with_user_message_for_gemini_structured_output():
+def test_format_request_ends_with_user_message_for_structured_output():
     messages = [HumanMessage(content="采购500台设备"), AIMessage(content="最终采购方案")]
     request = ModelRequest(
         AgentExecution("main", {}, session_id="format-context"),

@@ -20,7 +20,6 @@ from agent_harness import (
     load_mcp_tools,
 )
 from langchain_core.language_models import BaseChatModel
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
 from pydantic import TypeAdapter
 
@@ -36,11 +35,6 @@ from .services import ProcurementServices
 from .sql_catalog import role_database_context
 
 _MCP_TOOL_CACHE: list[Any] | None = None
-GEMINI_MODEL_NAME = "gemini-3.5-flash-lite"
-GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
-GLM_MODEL_NAME = "glm-4.7-flash"
-GLM_API_KEY_ENV = "GLM_API_KEY"
-GLM_BASE_URL = "https://open.bigmodel.cn/api/paas/v4/"
 DEEPSEEK_MODEL_NAME = "deepseek-flash"
 DEEPSEEK_API_KEY_ENV = "DEEPSEEK_API_KEY"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
@@ -55,40 +49,6 @@ AGENT_ROLES = (
     "execution",
     "main",
 )
-
-
-def _create_gemini_model() -> ChatGoogleGenerativeAI:
-    api_key = os.getenv(GEMINI_API_KEY_ENV)
-    if not api_key:
-        raise RuntimeError(
-            f"Real mode requires the {GEMINI_API_KEY_ENV} environment variable. "
-            "Set it before starting the application, or pass model/role_models explicitly."
-        )
-    model = ChatGoogleGenerativeAI(
-        model=GEMINI_MODEL_NAME,
-        api_key=api_key,
-        thinking_level="minimal",
-    )
-    # langchain-google-genai 4.4.0 injects candidate_count=1 by default, but
-    # Gemini 3.x rejects candidate_count. Setting its internal alias to None
-    # makes the request serializer omit the unsupported field entirely.
-    if getattr(model, "model", None) == GEMINI_MODEL_NAME and hasattr(model, "n"):
-        model.n = None
-    return model
-
-
-def _create_glm_model() -> ChatOpenAI:
-    api_key = os.getenv(GLM_API_KEY_ENV)
-    if not api_key:
-        raise RuntimeError(
-            f"GLM real mode requires the {GLM_API_KEY_ENV} environment variable. "
-            "Set it before starting the application."
-        )
-    return ChatOpenAI(
-        model=GLM_MODEL_NAME,
-        api_key=api_key,
-        base_url=GLM_BASE_URL,
-    )
 
 
 def _create_deepseek_model() -> ChatOpenAI:
@@ -107,17 +67,13 @@ def _create_deepseek_model() -> ChatOpenAI:
 
 
 def _create_default_model() -> BaseChatModel:
-    provider = os.getenv(MODEL_PROVIDER_ENV, "glm").strip().lower()
-    if provider not in {"deepseek", "gemini", "glm"}:
+    provider = os.getenv(MODEL_PROVIDER_ENV, "deepseek").strip().lower()
+    if provider != "deepseek":
         raise RuntimeError(
             f"Unsupported {MODEL_PROVIDER_ENV}={provider!r}; "
-            "expected 'deepseek', 'gemini', or 'glm'."
+            "expected 'deepseek'."
         )
-    if provider == "deepseek":
-        return _create_deepseek_model()
-    if provider == "gemini":
-        return _create_gemini_model()
-    return _create_glm_model()
+    return _create_deepseek_model()
 
 
 async def _supplier_mcp_tools() -> list[Any]:
@@ -173,7 +129,7 @@ async def create_procurement_app_async(
 ) -> ProcurementApplication:
     """Create the application.
 
-    Real mode defaults to one application-owned Gemini or GLM model selected from
+    Real mode defaults to one application-owned DeepSeek model selected from
     environment configuration. Explicit ``model`` and ``role_models`` values
     override that default. The deterministic model is an explicit test double.
     """

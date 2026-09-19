@@ -287,60 +287,17 @@ def test_production_factory_uses_explicit_configured_model(tmp_path):
         application.close()
 
 
-def test_production_factory_creates_one_default_gemini_for_all_agents(
-    tmp_path, monkeypatch
-):
+def test_production_factory_creates_one_default_deepseek_for_all_agents(tmp_path, monkeypatch):
     default_model = BindableFakeChatModel(responses=["{}"])
     constructor_calls = []
 
-    def create_gemini(**kwargs):
+    def create_deepseek(**kwargs):
         constructor_calls.append(kwargs)
         return default_model
 
-    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
-    monkeypatch.delenv("GLM_API_KEY", raising=False)
-    monkeypatch.setenv("PROCUREMENT_MODEL_PROVIDER", "gemini")
-    monkeypatch.setattr(factory_module, "ChatGoogleGenerativeAI", create_gemini)
-
-    application = create_procurement_app(
-        data_dir=tmp_path,
-        reset_database=True,
-        enable_mcp=False,
-    )
-    try:
-        assert constructor_calls == [
-            {
-                "model": factory_module.GEMINI_MODEL_NAME,
-                "api_key": "test-gemini-key",
-                "thinking_level": "minimal",
-            }
-        ]
-        assert application.agent.definition.model is default_model
-        assert application.agent.definition.runtime_config.timeout_seconds == 90
-        assert all(
-            subagent.definition.model is default_model
-            for subagent in application.agent._subagents.values()
-        )
-        assert all(
-            subagent.definition.runtime_config.timeout_seconds == 60
-            for subagent in application.agent._subagents.values()
-        )
-    finally:
-        application.close()
-
-
-def test_production_factory_creates_one_default_glm_for_all_agents(tmp_path, monkeypatch):
-    default_model = BindableFakeChatModel(responses=["{}"])
-    constructor_calls = []
-
-    def create_glm(**kwargs):
-        constructor_calls.append(kwargs)
-        return default_model
-
-    monkeypatch.setenv("GEMINI_API_KEY", "unused-gemini-key")
-    monkeypatch.setenv("GLM_API_KEY", "test-glm-key")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-deepseek-key")
     monkeypatch.delenv("PROCUREMENT_MODEL_PROVIDER", raising=False)
-    monkeypatch.setattr(factory_module, "ChatOpenAI", create_glm)
+    monkeypatch.setattr(factory_module, "ChatOpenAI", create_deepseek)
 
     application = create_procurement_app(
         data_dir=tmp_path,
@@ -350,9 +307,10 @@ def test_production_factory_creates_one_default_glm_for_all_agents(tmp_path, mon
     try:
         assert constructor_calls == [
             {
-                "model": factory_module.GLM_MODEL_NAME,
-                "api_key": "test-glm-key",
-                "base_url": factory_module.GLM_BASE_URL,
+                "model": factory_module.DEEPSEEK_MODEL_NAME,
+                "api_key": "test-deepseek-key",
+                "base_url": factory_module.DEEPSEEK_BASE_URL,
+                "extra_body": {"thinking": {"type": "disabled"}},
             }
         ]
         assert application.agent.definition.model is default_model
@@ -399,42 +357,18 @@ def test_production_factory_creates_one_deepseek_for_all_agents(tmp_path, monkey
         application.close()
 
 
-def test_explicit_glm_provider_wins_when_both_keys_exist(tmp_path, monkeypatch):
-    default_model = BindableFakeChatModel(responses=["{}"])
-    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
-    monkeypatch.setenv("GLM_API_KEY", "test-glm-key")
-    monkeypatch.setenv("PROCUREMENT_MODEL_PROVIDER", "glm")
-    monkeypatch.setattr(factory_module, "ChatOpenAI", lambda **kwargs: default_model)
-    monkeypatch.setattr(
-        factory_module,
-        "ChatGoogleGenerativeAI",
-        lambda **kwargs: pytest.fail("explicit GLM selection must not construct Gemini"),
-    )
-
-    application = create_procurement_app(
-        data_dir=tmp_path,
-        reset_database=True,
-        enable_mcp=False,
-    )
-    try:
-        assert application.agent.definition.model is default_model
-    finally:
-        application.close()
-
-
-def test_role_model_overrides_default_gemini_only_for_its_role(tmp_path, monkeypatch):
+def test_role_model_overrides_default_deepseek_only_for_its_role(tmp_path, monkeypatch):
     default_model = BindableFakeChatModel(responses=["{}"])
     supplier_model = BindableFakeChatModel(responses=["{}"])
     constructor_calls = []
 
-    def create_gemini(**kwargs):
+    def create_deepseek(**kwargs):
         constructor_calls.append(kwargs)
         return default_model
 
-    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
-    monkeypatch.delenv("GLM_API_KEY", raising=False)
-    monkeypatch.setenv("PROCUREMENT_MODEL_PROVIDER", "gemini")
-    monkeypatch.setattr(factory_module, "ChatGoogleGenerativeAI", create_gemini)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-deepseek-key")
+    monkeypatch.delenv("PROCUREMENT_MODEL_PROVIDER", raising=False)
+    monkeypatch.setattr(factory_module, "ChatOpenAI", create_deepseek)
 
     application = create_procurement_app(
         data_dir=tmp_path,
@@ -452,11 +386,10 @@ def test_role_model_overrides_default_gemini_only_for_its_role(tmp_path, monkeyp
 
 
 def test_real_mode_without_model_or_api_key_fails_clearly(tmp_path, monkeypatch):
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.delenv("GLM_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.delenv("PROCUREMENT_MODEL_PROVIDER", raising=False)
 
-    with pytest.raises(RuntimeError, match="GLM_API_KEY"):
+    with pytest.raises(RuntimeError, match="DEEPSEEK_API_KEY"):
         create_procurement_app(
             data_dir=tmp_path,
             reset_database=True,
@@ -464,14 +397,9 @@ def test_real_mode_without_model_or_api_key_fails_clearly(tmp_path, monkeypatch)
         )
 
 
-def test_deterministic_mode_never_constructs_gemini(tmp_path, monkeypatch):
-    def unexpected_gemini(**kwargs):
-        raise AssertionError(f"Gemini should not be created in deterministic mode: {kwargs}")
-
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.delenv("GLM_API_KEY", raising=False)
+def test_deterministic_mode_never_constructs_real_model(tmp_path, monkeypatch):
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.delenv("PROCUREMENT_MODEL_PROVIDER", raising=False)
-    monkeypatch.setattr(factory_module, "ChatGoogleGenerativeAI", unexpected_gemini)
     application = create_procurement_app(
         data_dir=tmp_path,
         reset_database=True,

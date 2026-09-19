@@ -1,8 +1,8 @@
 """One-click launcher for the procurement web demo.
 
 Run ``python run.py`` from the project root. The small Tk window chooses the
-deterministic model, Gemini, GLM, or DeepSeek, then starts the API and static
-frontend in child processes.
+deterministic model or DeepSeek, then starts the API and static frontend in
+child processes.
 """
 
 from __future__ import annotations
@@ -133,18 +133,6 @@ def choose_mode() -> str:
     ).pack(pady=4)
     tk.Button(
         buttons,
-        text="Real 模式（Gemini）",
-        width=25,
-        command=lambda: select("gemini"),
-    ).pack(pady=4)
-    tk.Button(
-        buttons,
-        text="Real 模式（GLM-4.7-Flash）",
-        width=25,
-        command=lambda: select("glm"),
-    ).pack(pady=4)
-    tk.Button(
-        buttons,
         text="Real 模式（DeepSeek V4 Flash）",
         width=25,
         command=lambda: select("deepseek"),
@@ -195,8 +183,6 @@ def main() -> int:
         environment["PROCUREMENT_MODEL_PROVIDER"] = mode
         key_name = {
             "deepseek": "DEEPSEEK_API_KEY",
-            "gemini": "GEMINI_API_KEY",
-            "glm": "GLM_API_KEY",
         }[mode]
         if not environment.get(key_name):
             raise SystemExit(f"{mode.upper()} Real 模式需要先设置 {key_name} 环境变量。")

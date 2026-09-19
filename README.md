@@ -4,11 +4,9 @@
 供应商、价格、预算、风险与执行七个 SubAgent；采购写操作由 Execution Agent 发起，并由
 Harness 原生 HITL 在持久化 Checkpoint 上暂停和恢复。
 
-正式应用支持 Gemini、智谱 GLM 和 DeepSeek。Gemini 使用 `ChatGoogleGenerativeAI`，模型为
-`gemini-3.5-flash-lite`（`thinking_level="minimal"`）；GLM 使用智谱的 OpenAI 兼容接口，模型为
-`glm-4.7-flash`；DeepSeek 使用官方 OpenAI 兼容接口和当前 Flash 编码 `deepseek-flash`。
-API Key 只从系统环境变量 `GEMINI_API_KEY`、`GLM_API_KEY` 或 `DEEPSEEK_API_KEY` 读取，不写入
-代码或配置文件。默认提供商为 GLM；可用 `PROCUREMENT_MODEL_PROVIDER=gemini|deepseek` 切换。
+正式应用使用 DeepSeek 官方 OpenAI 兼容接口和当前 Flash 编码 `deepseek-flash`。
+API Key 只从系统环境变量 `DEEPSEEK_API_KEY` 读取，不写入代码或配置文件。
+默认提供商为 DeepSeek，`PROCUREMENT_MODEL_PROVIDER` 仅接受 `deepseek`。
 DeepSeek 显式发送 `thinking.type=disabled`，避免多轮 Tool Call 因历史 `reasoning_content` 未回传
 而被接口拒绝。Main Agent 委派 Requirement Agent 时会强制补入最新用户原始消息，防止空
 `procurement_context` 造成需求字段丢失。
@@ -88,26 +86,12 @@ Skill。加载事件记录在现有 Trace 的 `skill.load` 中。
 在项目根目录运行：
 
 ```powershell
-$env:GEMINI_API_KEY = "your-gemini-api-key"
-.\.venv\Scripts\python.exe run.py
-```
-
-使用 GLM 时改为：
-
-```powershell
-$env:GLM_API_KEY = "your-glm-api-key"
-.\.venv\Scripts\python.exe run.py
-```
-
-使用 DeepSeek V4 Flash 时：
-
-```powershell
 $env:DEEPSEEK_API_KEY = "your-deepseek-api-key"
 .\.venv\Scripts\python.exe run.py
 ```
 
-启动器会弹出模式选择窗口。Demo 模式直接使用确定性模型且无需 API Key；三个 Real 模式分别
-使用 Gemini、GLM 或 DeepSeek。DeepSeek 按钮使用当前官方编码 `deepseek-flash`（V4.1 Flash；
+启动器会弹出模式选择窗口。Demo 模式直接使用确定性模型且无需 API Key；Real 模式使用
+DeepSeek。DeepSeek 按钮使用当前官方编码 `deepseek-flash`（V4.1 Flash；
 旧 `deepseek-v4-flash` 编码目前仅为临时兼容别名）。
 选择后会自动启动 FastAPI 和前端静态服务，并打开浏览器；在启动窗口按 `Ctrl+C` 会尽量正常
 停止两个子进程。可用
@@ -135,12 +119,12 @@ cd D:\Project\agent
 后修改并继续。修改复用同一 Session，再次审批才会执行新方案。
 浏览器保存最近的 Session ID；刷新或重启后端后也可输入该 ID 恢复查看和审批。
 
-正式模型模式须移除演示标志，配置提供商和对应的 API Key。以下示例使用 GLM：
+正式模型模式须移除演示标志，并配置 DeepSeek API Key：
 
 ```powershell
 Remove-Item Env:PROCUREMENT_DEMO -ErrorAction SilentlyContinue
-$env:PROCUREMENT_MODEL_PROVIDER = "glm"
-$env:GLM_API_KEY = "your-glm-api-key"
+$env:PROCUREMENT_MODEL_PROVIDER = "deepseek"
+$env:DEEPSEEK_API_KEY = "your-deepseek-api-key"
 .\.venv\Scripts\python.exe -m uvicorn backend.app:app --host 127.0.0.1 --port 8000
 ```
 
@@ -202,17 +186,14 @@ Trace 读取直接利用现有 JSONL 文件，适合本地演示；长期大量�
 
 ### 真实 LLM Benchmark
 
-配置任一模型的 API Key 后，一条命令会执行固定采购场景并生成可追溯的 JSON、CSV、Markdown
+配置 DeepSeek API Key 后，一条命令会执行固定采购场景并生成可追溯的 JSON、CSV、Markdown
 报告以及逐场景 JSONL Trace：
 
 ```powershell
-$env:GEMINI_API_KEY = "your-gemini-api-key"
-$env:PROCUREMENT_MODEL_PROVIDER = "gemini"
+$env:DEEPSEEK_API_KEY = "your-deepseek-api-key"
+$env:PROCUREMENT_MODEL_PROVIDER = "deepseek"
 .\.venv\Scripts\python.exe benchmark/run.py
 ```
-
-若使用 GLM，请设置 `$env:GLM_API_KEY` 和 `$env:PROCUREMENT_MODEL_PROVIDER = "glm"`；若使用
-DeepSeek，请设置 `$env:DEEPSEEK_API_KEY` 和 `$env:PROCUREMENT_MODEL_PROVIDER = "deepseek"`。
 
 结果写入 `benchmark/results/`，可读报告写入 `benchmark/reports/`。使用
 `--label before` 和 `--label after` 保存两个版本的基准数据；当两份数据同时存在时，后续报告
@@ -232,11 +213,11 @@ DeepSeek，请设置 `$env:DEEPSEEK_API_KEY` 和 `$env:PROCUREMENT_MODEL_PROVIDE
 
 ### CLI / Python
 
-正式运行默认使用应用层根据环境变量统一创建的模型。以下示例使用 GLM：
+正式运行默认使用应用层根据环境变量统一创建的 DeepSeek 模型：
 
 ```powershell
-$env:PROCUREMENT_MODEL_PROVIDER = "glm"
-$env:GLM_API_KEY = "your-glm-api-key"
+$env:PROCUREMENT_MODEL_PROVIDER = "deepseek"
+$env:DEEPSEEK_API_KEY = "your-deepseek-api-key"
 .\.venv\Scripts\python.exe main.py --data-dir .\data demo --approve --session demo-001
 ```
 

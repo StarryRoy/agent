@@ -12,10 +12,6 @@ from pathlib import Path
 from procurement_agent.factory import (
     DEEPSEEK_API_KEY_ENV,
     DEEPSEEK_MODEL_NAME,
-    GEMINI_API_KEY_ENV,
-    GEMINI_MODEL_NAME,
-    GLM_API_KEY_ENV,
-    GLM_MODEL_NAME,
     MODEL_PROVIDER_ENV,
 )
 
@@ -51,15 +47,8 @@ class BenchmarkConfig:
     def model_label(self) -> str:
         if self.deterministic:
             return "deterministic test double"
-        provider = os.getenv(MODEL_PROVIDER_ENV, "glm").strip().lower()
-        if provider == "deepseek":
-            default_name = DEEPSEEK_MODEL_NAME
-        elif provider == "glm":
-            default_name = GLM_MODEL_NAME
-        elif provider == "gemini":
-            default_name = GEMINI_MODEL_NAME
-        else:
-            default_name = "N/A"
+        provider = os.getenv(MODEL_PROVIDER_ENV, "deepseek").strip().lower()
+        default_name = DEEPSEEK_MODEL_NAME if provider == "deepseek" else "N/A"
         primary = self.model or default_name
         if not self.role_models:
             return primary
@@ -126,14 +115,10 @@ def load_config(argv: list[str] | None = None) -> BenchmarkConfig:
         compare_before=args.compare_before,
         compare_after=args.compare_after,
     )
-    provider = os.getenv(MODEL_PROVIDER_ENV, "glm").strip().lower()
-    provider_keys = {
-        "deepseek": DEEPSEEK_API_KEY_ENV,
-        "gemini": GEMINI_API_KEY_ENV,
-        "glm": GLM_API_KEY_ENV,
-    }
+    provider = os.getenv(MODEL_PROVIDER_ENV, "deepseek").strip().lower()
+    provider_keys = {"deepseek": DEEPSEEK_API_KEY_ENV}
     if provider not in provider_keys:
-        parser.error(f"{MODEL_PROVIDER_ENV} must be 'deepseek', 'gemini', or 'glm'")
+        parser.error(f"{MODEL_PROVIDER_ENV} must be 'deepseek'")
     key_name = provider_keys[provider]
     provider_has_key = os.getenv(key_name)
     has_primary = bool(config.model or provider_has_key)
