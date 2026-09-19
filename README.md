@@ -110,7 +110,7 @@ $env:PROCUREMENT_DEMO = "1"
 
 # 终端 2：前端，无需 Node.js 或构建步骤
 cd D:\Project\agent
-.\.venv\Scripts\python.exe -m http.server 5173 --bind 127.0.0.1 --directory frontend
+.\.venv\Scripts\python.exe frontend\static_server.py 5173 --bind 127.0.0.1 --directory frontend
 ```
 
 打开 [采购工作台](http://127.0.0.1:5173)，点击“填入演示需求”，再点击“开始分析”。
