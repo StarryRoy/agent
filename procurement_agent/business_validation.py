@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import types
 from collections.abc import Mapping
 from math import isclose
-from typing import Any
+from typing import Annotated, Any, Union, get_args, get_origin
 
-from pydantic import TypeAdapter
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from .schemas import SUBAGENT_OUTPUT_TYPES
+from .tool_contracts import ExecutionArgs
 
 FIELD_BY_AGENT = {
     "requirement_agent": "requirement",
@@ -61,6 +63,122 @@ DOWNSTREAM_FIELDS = {
 
 class BusinessConsistencyError(ValueError):
     """A structurally valid result contradicts confirmed procurement state."""
+
+
+def _project_contract_value(value: Any, annotation: Any) -> Any:
+    """Project a State value onto a nested Pydantic contract.
+
+    Confirmed SubAgent outputs may contain role-only annotations such as
+    ``remarks``.  ExecutionArgs is intentionally strict, so merely selecting
+    the three top-level values is not enough: nested contract objects must be
+    projected as well before strict validation.
+    """
+
+    origin = get_origin(annotation)
+    if origin is Annotated:
+        return _project_contract_value(value, get_args(annotation)[0])
+
+    if origin in (list, tuple, set, frozenset):
+        item_types = get_args(annotation)
+        item_type = item_types[0] if item_types else Any
+        if isinstance(value, list):
+            return [_project_contract_value(item, item_type) for item in value]
+        return value
+
+    if origin is dict:
+        key_type, value_type = (*get_args(annotation), Any, Any)[:2]
+        if isinstance(value, Mapping):
+            return {
+                _project_contract_value(key, key_type): _project_contract_value(item, value_type)
+                for key, item in value.items()
+            }
+        return value
+
+    if origin in (Union, types.UnionType):
+        candidates = [candidate for candidate in get_args(annotation) if candidate is not type(None)]
+        if isinstance(value, Mapping):
+            for candidate in candidates:
+                if not isinstance(candidate, type) or not issubclass(candidate, BaseModel):
+                    continue
+                projected = _project_contract_value(value, candidate)
+                try:
+                    candidate.model_validate(projected)
+                except ValidationError:
+                    continue
+                return projected
+        return value
+
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        if not isinstance(value, Mapping):
+            return value
+        return {
+            name: _project_contract_value(value[name], field.annotation)
+            for name, field in annotation.model_fields.items()
+            if name in value
+        }
+
+    return value
+
+
+def _state_results(state: Mapping[str, Any]) -> Mapping[str, Any]:
+    results = state.get("procurement_results")
+    return results if isinstance(results, Mapping) else state
+
+
+def build_execution_arguments(
+    state: Mapping[str, Any], session_id: str | None
+) -> dict[str, Any]:
+    """Build the only argument shape allowed at the execution Tool boundary.
+
+    The model's proposed Tool arguments are deliberately ignored.  The
+    request, recommended plan, and budget are read from the already confirmed
+    business State, projected onto the exact Tool contract, and then strictly
+    validated.  Missing or inconsistent State raises before Harness can create
+    the execution approval interrupt.
+    """
+
+    results = _state_results(state)
+    requirement = results.get("requirement")
+    risk = results.get("risk_analysis")
+    budget = results.get("budget_analysis")
+    if not isinstance(requirement, Mapping):
+        raise BusinessConsistencyError("执行前缺少已确认需求 State")
+    if not isinstance(risk, Mapping):
+        raise BusinessConsistencyError("执行前缺少已确认风险 State")
+    if not isinstance(budget, Mapping):
+        raise BusinessConsistencyError("执行前缺少已确认预算 State")
+    if risk.get("status") != "success" or risk.get("recommended_plan") is None:
+        raise BusinessConsistencyError("风险校验未形成可执行推荐方案")
+
+    raw_values = {
+        "request": requirement.get("request"),
+        "recommended_plan": risk.get("recommended_plan"),
+        "budget_analysis": budget,
+        "session_id": session_id,
+    }
+    projected = {
+        name: _project_contract_value(raw_values[name], field.annotation)
+        for name, field in ExecutionArgs.model_fields.items()
+    }
+    validated = ExecutionArgs.model_validate(projected)
+    request = validated.request.model_dump(mode="json")
+    plan = validated.recommended_plan.model_dump(mode="json")
+    budget_value = validated.budget_analysis.model_dump(mode="json")
+
+    # Execution receives only the execution dependency projection
+    # (requirement + risk + budget); the inventory shortfall is intentionally
+    # not part of this SubAgent boundary.  Risk validation has already
+    # confirmed the plan's relation to that shortfall, so this final check
+    # validates the plan's own arithmetic without reinterpreting demand here.
+    _validate_plan(plan, int(plan["quantity"]), request)
+    if not plan["meets_quantity"] or not plan["meets_deadline"]:
+        raise BusinessConsistencyError("推荐方案未通过数量或交期硬约束")
+    if float(plan["total_cost"]) > float(budget_value["effective_available_budget"]):
+        raise BusinessConsistencyError("推荐方案超出已确认有效预算")
+    if plan["risk_level"] == "critical":
+        raise BusinessConsistencyError("推荐方案风险等级禁止执行")
+
+    return validated.model_dump(mode="json")
 
 
 def missing_dependencies(agent_name: str, state: Mapping[str, Any]) -> list[str]:

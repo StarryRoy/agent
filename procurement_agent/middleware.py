@@ -16,11 +16,131 @@ from .business_validation import (
     FIELD_BY_AGENT,
     STAGE_DEPENDENCIES,
     BusinessConsistencyError,
+    build_execution_arguments,
     missing_dependencies,
     validate_business_result,
 )
 from .context import DEPENDENCIES, decode, task_view
 from .test_runtime import ProcurementTestConfig, use_test_config
+
+
+class ExecutionToolInputMiddleware(AgentMiddleware):
+    """Build execution arguments from the confirmed State before approval.
+
+    Execution is the one sensitive Tool whose arguments must never be accepted
+    from the model's copy of upstream data.  This hook runs after the model
+    response but before Harness validates the Tool call and creates HITL, so a
+    malformed or incomplete State becomes a preflight result rather than an
+    approval followed by a schema failure.
+    """
+
+    @staticmethod
+    def _task(request: Any) -> Mapping[str, Any]:
+        messages = getattr(request, "messages", None)
+        if messages is None:
+            messages = request.state.get("messages", [])
+        for message in reversed(messages):
+            if not isinstance(message, HumanMessage):
+                continue
+            value = decode(message.content)
+            if isinstance(value, Mapping):
+                return value
+            break
+        return {}
+
+    @classmethod
+    def _confirmed_state(cls, request: Any) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+        task = cls._task(request)
+        results = request.state.get("procurement_results")
+        if isinstance(results, Mapping) and results:
+            return results, task
+        upstream = task.get("upstream_state")
+        return (upstream if isinstance(upstream, Mapping) else {}), task
+
+    @staticmethod
+    def _preflight_failure(error: Exception) -> AIMessage:
+        return AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "agent_harness_structured_response",
+                    "args": {
+                        "status": "failed",
+                        "error": {
+                            "type": "execution_preflight_invalid_state",
+                            "message": f"执行前 State 未通过校验: {error}",
+                            "retryable": False,
+                        },
+                        "executed_actions": [],
+                    },
+                    "id": "execution-preflight-failure",
+                    "type": "tool_call",
+                }
+            ],
+        )
+
+    @staticmethod
+    def _preflight_result(error: Exception) -> dict[str, Any]:
+        return {
+            "status": "failed",
+            "error": {
+                "type": "execution_preflight_invalid_state",
+                "message": f"执行前 State 未通过校验: {error}",
+                "retryable": False,
+            },
+            "executed_actions": [],
+        }
+
+    def after_model(self, request: Any, response: Any) -> Any:
+        if request.execution.agent_name != "execution_agent" or not isinstance(response, AIMessage):
+            return response
+        calls = list(response.tool_calls)
+        execution_calls = [call for call in calls if call.get("name") == "execute_procurement_plan"]
+        if not execution_calls:
+            return response
+
+        confirmed_state, task = self._confirmed_state(request)
+        session_id = task.get("session_id") or request.execution.session_id
+        try:
+            arguments = build_execution_arguments(confirmed_state, session_id)
+        except (BusinessConsistencyError, KeyError, TypeError, ValidationError) as exc:
+            return self._preflight_failure(exc)
+
+        updated_calls = [
+            {**call, "args": arguments} if call.get("name") == "execute_procurement_plan" else call
+            for call in calls
+        ]
+        return response.model_copy(update={"tool_calls": updated_calls})
+
+    def wrap_tool_call(self, request: ToolRequest, call_next: Any) -> Any:
+        if (
+            request.execution.agent_name != "execution_agent"
+            or request.tool.name != "execute_procurement_plan"
+        ):
+            return call_next(request)
+        confirmed_state, task = self._confirmed_state(request)
+        session_id = task.get("session_id") or request.execution.session_id
+        try:
+            # This second guard also covers a resumed HITL edit: edited
+            # arguments are never allowed to replace confirmed State.
+            request.arguments = build_execution_arguments(confirmed_state, session_id)
+        except (BusinessConsistencyError, KeyError, TypeError, ValidationError) as exc:
+            return self._preflight_result(exc)
+        return call_next(request)
+
+    async def awrap_tool_call(self, request: ToolRequest, call_next: Any) -> Any:
+        if (
+            request.execution.agent_name != "execution_agent"
+            or request.tool.name != "execute_procurement_plan"
+        ):
+            return await call_next(request)
+        confirmed_state, task = self._confirmed_state(request)
+        session_id = task.get("session_id") or request.execution.session_id
+        try:
+            request.arguments = build_execution_arguments(confirmed_state, session_id)
+        except (BusinessConsistencyError, KeyError, TypeError, ValidationError) as exc:
+            return self._preflight_result(exc)
+        return await call_next(request)
 
 
 class ProcurementOrchestrationMiddleware(AgentMiddleware):

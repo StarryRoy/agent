@@ -127,13 +127,13 @@ def choose_mode() -> str:
 
     tk.Button(
         buttons,
-        text="Demo 模式（无需 API Key）",
+        text="Demo 模式(无需LLM)",
         width=25,
         command=lambda: select("demo"),
     ).pack(pady=4)
     tk.Button(
         buttons,
-        text="Real 模式（DeepSeek V4 Flash）",
+        text="Real 模式",
         width=25,
         command=lambda: select("deepseek"),
     ).pack(pady=4)

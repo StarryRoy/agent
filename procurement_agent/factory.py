@@ -27,7 +27,7 @@ from .application import ProcurementApplication
 from .context import ProcurementContextMiddleware
 from .database import ProcurementSQLiteBackend, initialize_database
 from .metrics import JsonLinesEventSink, ObservedDatabaseToolkit, ProcurementMetricSink
-from .middleware import ProcurementOrchestrationMiddleware
+from .middleware import ExecutionToolInputMiddleware, ProcurementOrchestrationMiddleware
 from .models import DeterministicProcurementModel, build_mock_execute_query_tool
 from .persistence import PersistentSQLiteSaver
 from .schemas import SUBAGENT_OUTPUT_TYPES, ProcurementDecision, ProcurementState
@@ -253,6 +253,9 @@ async def create_procurement_app_async(
             )
         if role == "supplier":
             role_tools.extend(mcp_tools)
+        agent_middleware = [ProcurementContextMiddleware()]
+        if role == "execution":
+            agent_middleware.append(ExecutionToolInputMiddleware())
         subagents.append(
             create_agent(
                 name=f"{role}_agent",
@@ -261,9 +264,7 @@ async def create_procurement_app_async(
                 model=model_for(role),
                 skills=selected_skills,
                 response_format=TypeAdapter(SUBAGENT_OUTPUT_TYPES[f"{role}_agent"]).json_schema(),
-                middleware=[
-                    ProcurementContextMiddleware(),
-                ],
+                middleware=agent_middleware,
                 tools=role_tools,
                 runtime_config=sub_config,
                 checkpointer=checkpointer,

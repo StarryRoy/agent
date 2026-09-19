@@ -8,6 +8,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from procurement_agent.business_validation import (
     BusinessConsistencyError,
+    build_execution_arguments,
     validate_business_result,
 )
 from procurement_agent.models import build_mock_execute_query_tool
@@ -278,6 +279,19 @@ def test_complete_chain_passes_deterministic_business_consistency_validation():
         }
     )
     state["risk_analysis"] = validate_business_result("risk_agent", risk, state)
+    execution_state = copy.deepcopy(state)
+    execution_state["budget_analysis"]["remarks"] = ["仅供预算 Agent 展示"]
+    strict_arguments = build_execution_arguments(execution_state, "contract-test")
+    assert set(strict_arguments) == {
+        "request",
+        "recommended_plan",
+        "budget_analysis",
+        "session_id",
+    }
+    assert "remarks" not in strict_arguments["budget_analysis"]
+    del execution_state["budget_analysis"]["effective_available_budget"]
+    with pytest.raises(ValidationError):
+        build_execution_arguments(execution_state, "contract-test")
     drifted_risk = copy.deepcopy(risk)
     drifted_risk["recommended_plan"]["quantity"] = 500
     with pytest.raises(BusinessConsistencyError, match="分配数量"):
