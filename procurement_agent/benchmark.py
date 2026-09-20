@@ -2,7 +2,7 @@
 
 This module deliberately keeps execution and scoring separate.  A scenario is
 used only to provide its user input and HITL actions to the application; its
-``expected_*`` fields are handed to :func:`score_scenario` only after the
+``expected_*`` fields are handed to the benchmark scorer only after the
 session has finished.
 """
 
@@ -14,6 +14,7 @@ import tempfile
 import time
 import traceback
 import uuid
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,163 @@ _DIMENSIONS = (
     "duration",
     "token_usage",
 )
+
+# These rules are intentionally local to the real-LLM benchmark.  The fixed
+# deterministic evaluator keeps its exact route/tool/replan checks in
+# evaluation.py; real models are allowed to retry and take another valid path.
+_AGENT_DEPENDENCIES: dict[str, set[str]] = {
+    "requirement_agent": set(),
+    "inventory_agent": {"requirement_agent"},
+    "supplier_agent": {"requirement_agent", "inventory_agent"},
+    "pricing_agent": {"requirement_agent", "inventory_agent", "supplier_agent"},
+    "budget_agent": {"requirement_agent", "pricing_agent"},
+    "risk_agent": {
+        "requirement_agent",
+        "inventory_agent",
+        "supplier_agent",
+        "pricing_agent",
+        "budget_agent",
+    },
+    "execution_agent": {"requirement_agent", "inventory_agent", "risk_agent", "budget_agent"},
+}
+
+_PROFILE_SUBAGENTS: dict[str, set[str]] = {
+    "normal": set(_AGENT_DEPENDENCIES),
+    "inventory_only": {"requirement_agent", "inventory_agent"},
+    "risk_replan": {
+        "requirement_agent",
+        "inventory_agent",
+        "supplier_agent",
+        "pricing_agent",
+        "budget_agent",
+        "risk_agent",
+    },
+    "cost_replan": {
+        "requirement_agent",
+        "inventory_agent",
+        "supplier_agent",
+        "pricing_agent",
+        "budget_agent",
+        "risk_agent",
+    },
+    "delivery_replan": {
+        "requirement_agent",
+        "inventory_agent",
+        "supplier_agent",
+        "pricing_agent",
+        "budget_agent",
+        "risk_agent",
+    },
+    "inventory_recovery": {
+        "requirement_agent",
+        "inventory_agent",
+        "supplier_agent",
+        "pricing_agent",
+        "budget_agent",
+        "risk_agent",
+        "execution_agent",
+    },
+    "modify_full": set(_AGENT_DEPENDENCIES),
+    "hitl_resume": set(_AGENT_DEPENDENCIES),
+}
+
+_AGENT_REQUIRED_TOOLS: dict[str, set[str]] = {
+    "requirement_agent": {"parse_requirement"},
+    "inventory_agent": {"execute_query", "calculate_inventory"},
+    "supplier_agent": {"execute_query", "calculate_suppliers"},
+    "pricing_agent": {"execute_query", "calculate_pricing"},
+    "budget_agent": {"execute_query", "calculate_budget"},
+    "risk_agent": {"execute_query", "calculate_risk"},
+}
+
+_SUBAGENT_NAMES = set(_AGENT_DEPENDENCIES)
+_KNOWN_TOOLS = _SUBAGENT_NAMES | {
+    "parse_requirement",
+    "load_skill",
+    "unload_skill",
+    "read_skill_asset",
+    "run_skill_script",
+    "agent_harness_structured_response",
+    "execute_query",
+    "calculate_inventory",
+    "calculate_suppliers",
+    "calculate_pricing",
+    "calculate_budget",
+    "calculate_risk",
+    "execute_procurement_plan",
+    "supplier_status",
+}
+
+_TOOL_REQUIRED_ARGUMENTS: dict[str, set[str]] = {
+    "parse_requirement": {"text", "previous_request"},
+    "execute_query": {"sql"},
+    "calculate_inventory": {"request", "query_result", "analysis_strategy"},
+    "calculate_suppliers": {"request", "inventory_analysis", "query_result", "analysis_strategy"},
+    "calculate_pricing": {
+        "request",
+        "inventory_analysis",
+        "supplier_analysis",
+        "query_result",
+        "analysis_strategy",
+    },
+    "calculate_budget": {
+        "request",
+        "pricing_analysis",
+        "query_result",
+        "analysis_strategy",
+    },
+    "calculate_risk": {
+        "request",
+        "supplier_analysis",
+        "pricing_analysis",
+        "budget_analysis",
+        "query_result",
+        "analysis_strategy",
+    },
+    "execute_procurement_plan": {
+        "request",
+        "recommended_plan",
+        "budget_analysis",
+        "session_id",
+    },
+    "supplier_status": {"supplier_codes"},
+}
+
+_TOOL_ALLOWED_AGENTS: dict[str, set[str]] = {
+    "parse_requirement": {"requirement_agent"},
+    "execute_query": {
+        "inventory_agent",
+        "supplier_agent",
+        "pricing_agent",
+        "budget_agent",
+        "risk_agent",
+    },
+    "calculate_inventory": {"inventory_agent"},
+    "calculate_suppliers": {"supplier_agent"},
+    "calculate_pricing": {"pricing_agent"},
+    "calculate_budget": {"budget_agent"},
+    "calculate_risk": {"risk_agent"},
+    "execute_procurement_plan": {"execution_agent"},
+    "supplier_status": {"supplier_agent"},
+}
+
+_FAULT_MARKERS: dict[str, tuple[str, ...]] = {
+    "simulate_sql_failure": ("table_not_found", "referenced table does not exist"),
+    "simulate_subagent_failure": (
+        "scripted inventory subagent failure",
+        "scripted supplier subagent failure",
+    ),
+    "simulate_mcp_failure": ("scripted external supplier-status outage",),
+    "simulate_execution_failure": (
+        "scripted_execution_failure",
+        "执行前外部采购系统失败",
+    ),
+    "simulate_atomic_failure": (
+        "atomic_execution_failed",
+        "采购事务已整体回滚",
+        "rolled_back",
+    ),
+}
 
 
 def _error_payload(exc: BaseException, *, phase: str) -> dict[str, str]:
@@ -69,6 +227,403 @@ def _empty_score() -> dict[str, Any]:
     }
 
 
+def _response_data(response: Any) -> dict[str, Any]:
+    if response is None:
+        return {}
+    data = getattr(response, "data", None)
+    if isinstance(data, dict):
+        return data
+    if hasattr(response, "as_dict"):
+        payload = response.as_dict()
+        if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+            return payload["data"]
+        return payload if isinstance(payload, dict) else {}
+    return data if isinstance(data, dict) else {}
+
+
+def _required_subagents(scenario: dict[str, Any]) -> set[str]:
+    explicit = scenario.get("expected_subagent_sequence")
+    if isinstance(explicit, (list, tuple)):
+        return {str(name) for name in explicit}
+    profile = str(scenario.get("expected_route_profile") or "")
+    return set(_PROFILE_SUBAGENTS.get(profile, set()))
+
+
+def _required_tools(scenario: dict[str, Any], required_agents: set[str]) -> set[str]:
+    required = {str(name) for name in (scenario.get("expected_tools") or [])}
+    forbidden = {str(name) for name in (scenario.get("forbidden_tools") or [])}
+    for agent in required_agents:
+        required.update(_AGENT_REQUIRED_TOOLS.get(agent, set()))
+    if scenario.get("expect_execution_tool") and "execute_procurement_plan" not in forbidden:
+        required.add("execute_procurement_plan")
+    if scenario.get("expected_min_mcp_calls", 0):
+        required.add("supplier_status")
+    return required - forbidden
+
+
+def _business_score(
+    scenario: dict[str, Any],
+    response: Any,
+    metrics: dict[str, Any],
+    duration_ms: float,
+) -> tuple[list[str], dict[str, bool]]:
+    """Reuse only deterministic business-result checks for the real benchmark."""
+
+    failures, dimensions, _ = score_scenario(scenario, response, metrics, duration_ms)
+    prefixes = ("parameter_extraction:", "final_plan:")
+    business_failures = [failure for failure in failures if failure.startswith(prefixes)]
+    business_dimensions = {
+        "parameter_extraction": bool(dimensions.get("parameter_extraction")),
+        "final_plan": bool(dimensions.get("final_plan")),
+    }
+    return business_failures, business_dimensions
+
+
+def _trace_tool_calls(trace_events: list[dict[str, Any]]) -> list[tuple[dict[str, Any], str, Any]]:
+    calls: list[tuple[dict[str, Any], str, Any]] = []
+    for event in trace_events:
+        if event.get("event_type") != "tool.start":
+            continue
+        metadata = event.get("metadata")
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        name = metadata.get("name", event.get("name"))
+        if not name:
+            continue
+        arguments = metadata.get("arguments", event.get("arguments"))
+        calls.append((event, str(name), arguments))
+    return calls
+
+
+def _tool_argument_problem(name: str, arguments: Any) -> str | None:
+    if not isinstance(arguments, Mapping):
+        return "arguments are not an object"
+
+    if name in _SUBAGENT_NAMES:
+        if not isinstance(arguments.get("task"), str) or not arguments["task"].strip():
+            return "missing non-empty task"
+        return None
+
+    if name == "load_skill":
+        return None if isinstance(arguments.get("name"), str) else "missing skill name"
+    if name == "unload_skill":
+        return None if isinstance(arguments.get("name"), str) else "missing skill name"
+    if name in {"read_skill_asset", "run_skill_script"}:
+        return None
+
+    required = _TOOL_REQUIRED_ARGUMENTS.get(name)
+    if required:
+        missing = sorted(key for key in required if key not in arguments)
+        if missing:
+            return f"missing required arguments {missing!r}"
+
+    if name == "parse_requirement" and not isinstance(arguments.get("text"), str):
+        return "text is not a string"
+    if name == "execute_query":
+        if not isinstance(arguments.get("sql"), str) or not arguments["sql"].strip():
+            return "sql is not a non-empty string"
+        parameters = arguments.get("parameters")
+        if parameters is not None and not isinstance(parameters, (Mapping, list, tuple)):
+            return "parameters are not an object or list"
+    if name == "supplier_status":
+        supplier_codes = arguments.get("supplier_codes")
+        if not isinstance(supplier_codes, (list, tuple)) or not all(
+            isinstance(code, str) and code for code in supplier_codes
+        ):
+            return "supplier_codes are not a list of strings"
+    if name == "execute_procurement_plan" and not isinstance(
+        arguments.get("session_id"), str
+    ):
+        return "session_id is not a string"
+    return None
+
+
+def _tool_owner_problem(event: dict[str, Any], name: str) -> str | None:
+    agent_name = event.get("agent_name")
+    if not agent_name:
+        return None
+    agent_name = str(agent_name)
+    if name in _SUBAGENT_NAMES:
+        return None if agent_name == "procurement_main_agent" else "subagent tool called outside main agent"
+    allowed = _TOOL_ALLOWED_AGENTS.get(name)
+    if allowed and agent_name not in allowed:
+        return f"tool called by {agent_name!r}, expected one of {sorted(allowed)!r}"
+    if name in {"load_skill", "unload_skill", "read_skill_asset", "run_skill_script"} and not agent_name.endswith(
+        "_agent"
+    ):
+        return f"skill tool called by {agent_name!r}"
+    return None
+
+
+def _routing_failures(
+    scenario: dict[str, Any], response: Any, metrics: dict[str, Any]
+) -> tuple[list[str], int]:
+    failures: list[str] = []
+    invalid_calls = 0
+    actual_route = [str(name) for name in (metrics.get("subagent_route") or [])]
+    required = _required_subagents(scenario)
+    forbidden = {str(name) for name in (scenario.get("forbidden_subagents") or [])}
+
+    for name in sorted(required - set(actual_route)):
+        failures.append(f"routing: required SubAgent {name!r} was not called")
+    for name in sorted(forbidden & set(actual_route)):
+        failures.append(f"routing: forbidden SubAgent {name!r} was called")
+        invalid_calls += actual_route.count(name)
+
+    seen: set[str] = set()
+    for name in actual_route:
+        dependencies = _AGENT_DEPENDENCIES.get(name)
+        if dependencies is None:
+            failures.append(f"routing: unknown SubAgent {name!r}")
+            invalid_calls += 1
+            continue
+        missing = sorted(dependencies - seen)
+        if missing:
+            failures.append(f"routing: {name!r} was called before {missing!r}")
+            invalid_calls += 1
+        seen.add(name)
+
+    allowed = scenario.get("allowed_subagents")
+    if allowed:
+        allowed_set = {str(name) for name in allowed}
+        for name in actual_route:
+            if name not in allowed_set:
+                failures.append(f"routing: SubAgent {name!r} is outside the allowed set")
+                invalid_calls += 1
+
+    expected_status = scenario.get("expected_status")
+    if expected_status is not None and getattr(response, "status", None) != expected_status:
+        failures.append(
+            f"routing: expected final business status {expected_status!r}; "
+            f"got {getattr(response, 'status', None)!r}"
+        )
+    expected_execution_status = scenario.get("expected_execution_status")
+    actual_execution_status = _response_data(response).get("execution_status")
+    if expected_execution_status is not None and actual_execution_status != expected_execution_status:
+        failures.append(
+            f"routing: expected execution status {expected_execution_status!r}; "
+            f"got {actual_execution_status!r}"
+        )
+    return failures, invalid_calls
+
+
+def _tool_failures(
+    scenario: dict[str, Any],
+    metrics: dict[str, Any],
+    trace_events: list[dict[str, Any]],
+) -> tuple[list[str], int]:
+    failures: list[str] = []
+    invalid_calls = 0
+    actual_tools = [str(name) for name in (metrics.get("tool_route") or [])]
+    required_agents = _required_subagents(scenario)
+    required_tools = _required_tools(scenario, required_agents)
+    forbidden = {str(name) for name in (scenario.get("forbidden_tools") or [])}
+
+    for name in sorted(required_tools - set(actual_tools)):
+        failures.append(f"tool_use: required Tool {name!r} was not called")
+    for name in sorted(forbidden & set(actual_tools)):
+        failures.append(f"tool_use: forbidden Tool {name!r} was called")
+        invalid_calls += actual_tools.count(name)
+    for name in actual_tools:
+        if name not in _KNOWN_TOOLS:
+            failures.append(f"tool_use: unknown Tool {name!r}")
+            invalid_calls += 1
+
+    allowed = scenario.get("allowed_tools")
+    if allowed:
+        allowed_set = {str(name) for name in allowed}
+        for name in actual_tools:
+            if name not in allowed_set:
+                failures.append(f"tool_use: Tool {name!r} is outside the allowed set")
+                invalid_calls += 1
+
+    for event, name, arguments in _trace_tool_calls(trace_events):
+        if name not in _KNOWN_TOOLS:
+            continue
+        problem = _tool_argument_problem(name, arguments)
+        if problem:
+            failures.append(f"tool_use: invalid arguments for {name!r}: {problem}")
+            invalid_calls += 1
+        owner_problem = _tool_owner_problem(event, name)
+        if owner_problem:
+            failures.append(f"tool_use: {name!r} has invalid ownership: {owner_problem}")
+            invalid_calls += 1
+    return failures, invalid_calls
+
+
+def _active_faults(scenario: dict[str, Any]) -> dict[str, Any]:
+    raw_input = scenario.get("input")
+    if not isinstance(raw_input, str):
+        return {}
+    try:
+        payload = json.loads(raw_input)
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(payload, Mapping):
+        return {}
+    return {
+        str(key): value
+        for key, value in payload.items()
+        if str(key).startswith("simulate_") and bool(value)
+    }
+
+
+def _fault_evidence(
+    response: Any,
+    metrics: dict[str, Any],
+    trace_events: list[dict[str, Any]],
+) -> str:
+    payload = {
+        "response": _response_data(response),
+        "metrics": metrics,
+        "trace": trace_events,
+    }
+    return json.dumps(payload, ensure_ascii=False, default=str).casefold()
+
+
+def _fault_was_observed(
+    fault_name: str,
+    fault_value: Any,
+    evidence: str,
+    scenario: dict[str, Any],
+    metrics: dict[str, Any],
+) -> bool:
+    markers = _FAULT_MARKERS.get(fault_name, ())
+    if any(marker.casefold() in evidence for marker in markers):
+        return True
+
+    route = [str(name) for name in (metrics.get("subagent_route") or [])]
+    errors = int(metrics.get("errors", 0) or 0)
+    if fault_name == "simulate_sql_failure" and int(metrics.get("database_errors", 0) or 0) > 0:
+        return True
+    if fault_name == "simulate_subagent_failure":
+        target = "supplier_agent" if str(fault_value).casefold() == "supplier" else "inventory_agent"
+        return route.count(target) >= 2 and errors > 0
+    if fault_name == "simulate_mcp_failure":
+        return "supplier_status" in set(metrics.get("tool_route") or []) and errors > 0
+    if fault_name == "simulate_execution_failure":
+        return (
+            "execute_procurement_plan" in set(metrics.get("tool_route") or [])
+            and scenario.get("expected_execution_status") == "failed"
+            and errors > 0
+        )
+    return False
+
+
+def _business_status(value: Any) -> str | None:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(value, Mapping):
+        return None
+    content = value.get("content")
+    if isinstance(content, Mapping) and isinstance(content.get("status"), str):
+        return str(content["status"])
+    if isinstance(value.get("status"), str) and any(
+        key in value for key in ("executed_actions", "purchase_request_id", "error", "transaction")
+    ):
+        return str(value["status"])
+    return None
+
+
+def _successful_execution_observed(trace_events: list[dict[str, Any]]) -> bool:
+    for event in trace_events:
+        if event.get("event_type") != "tool.end":
+            continue
+        metadata = event.get("metadata")
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        if str(metadata.get("name", event.get("name"))) != "execute_procurement_plan":
+            continue
+        result = metadata.get("result", event.get("result"))
+        if _business_status(result) == "success":
+            return True
+    return False
+
+
+def _exception_failures(
+    scenario: dict[str, Any],
+    response: Any,
+    metrics: dict[str, Any],
+    trace_events: list[dict[str, Any]],
+    final_plan_ok: bool,
+) -> list[str]:
+    active_faults = _active_faults(scenario)
+    evidence = _fault_evidence(response, metrics, trace_events)
+    failures: list[str] = []
+    for fault_name, fault_value in active_faults.items():
+        if not _fault_was_observed(fault_name, fault_value, evidence, scenario, metrics):
+            failures.append(f"exception_recovery: {fault_name!r} was not observed")
+    if active_faults and not final_plan_ok:
+        failures.append("exception_recovery: final state did not satisfy the expected safe outcome")
+
+    expected_execution_status = scenario.get("expected_execution_status")
+    if expected_execution_status in {"failed", "blocked", "not_required", "awaiting_approval"}:
+        if _successful_execution_observed(trace_events):
+            failures.append("exception_recovery: successful execution was observed for a non-success outcome")
+        if "simulate_atomic_failure" not in active_faults and "execute_write" in set(
+            metrics.get("database_route") or []
+        ):
+            failures.append("exception_recovery: execution wrote state for a non-success outcome")
+    return failures
+
+
+def score_real_llm_scenario(
+    scenario: dict[str, Any],
+    response: Any,
+    metrics: dict[str, Any],
+    duration_ms: float,
+    trace_events: list[dict[str, Any]] | None = None,
+) -> tuple[list[str], dict[str, bool], int]:
+    """Score one real-LLM case using semantic path checks.
+
+    Exact route/tool/replan counts, database-call expectations, duration, and
+    token budgets are deliberately absent from this function.  Only the two
+    business-result dimensions are delegated to the deterministic evaluator.
+    """
+
+    trace_events = trace_events or []
+    business_failures, business_dimensions = _business_score(
+        scenario, response, metrics, duration_ms
+    )
+    routing_failures, routing_invalid = _routing_failures(scenario, response, metrics)
+    tool_failures, tool_invalid = _tool_failures(scenario, metrics, trace_events)
+    exception_failures = _exception_failures(
+        scenario,
+        response,
+        metrics,
+        trace_events,
+        business_dimensions["final_plan"],
+    )
+    invalid_calls = routing_invalid + tool_invalid
+    failures = [*routing_failures, *tool_failures, *business_failures, *exception_failures]
+    dimensions = {
+        "routing": not routing_failures,
+        "tool_use": not tool_failures,
+        "parameter_extraction": business_dimensions["parameter_extraction"],
+        "final_plan": business_dimensions["final_plan"],
+        "exception_recovery": not exception_failures,
+        "invalid_calls": invalid_calls == 0,
+        # Performance values are recorded separately and never gate the case.
+        "duration": True,
+        "token_usage": True,
+    }
+    return failures, dimensions, invalid_calls
+
+
+def _read_trace_events(trace_path: Path) -> list[dict[str, Any]]:
+    if not trace_path.exists():
+        return []
+    events: list[dict[str, Any]] = []
+    for line in trace_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        event = json.loads(line)
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
 def _run_case(
     scenario: dict[str, Any],
     *,
@@ -83,6 +638,7 @@ def _run_case(
     app = None
     response = None
     runtime_metrics: dict[str, Any] = {}
+    trace_events: list[dict[str, Any]] = []
     execution_error: dict[str, Any] | None = None
     score_error: dict[str, Any] | None = None
 
@@ -111,14 +667,22 @@ def _run_case(
                 app.close()
             except Exception as exc:  # noqa: BLE001 - preserve the original case result
                 execution_error = execution_error or _error_payload(exc, phase="close")
+        try:
+            trace_events = _read_trace_events(case_dir / "traces.jsonl")
+        except Exception as exc:  # noqa: BLE001 - preserve the original case result
+            execution_error = execution_error or _error_payload(exc, phase="trace")
 
     duration_ms = (time.perf_counter() - started) * 1000
     if response is None:
         score = _empty_score()
     else:
         try:
-            failures, dimensions, invalid_calls = score_scenario(
-                scenario, response, runtime_metrics, duration_ms
+            failures, dimensions, invalid_calls = score_real_llm_scenario(
+                scenario,
+                response,
+                runtime_metrics,
+                duration_ms,
+                trace_events,
             )
             score = {
                 "passed": not failures and execution_error is None,

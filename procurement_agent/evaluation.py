@@ -345,13 +345,7 @@ def score_scenario(
     metrics: dict[str, Any],
     duration_ms: float,
 ) -> tuple[list[str], dict[str, bool], int]:
-    """Score one already-completed scenario.
-
-    The deterministic evaluation and the real-LLM benchmark intentionally use
-    the same checker.  Keeping this small public wrapper avoids making the
-    benchmark duplicate the evaluation rules while preserving ``_check`` for
-    the existing evaluation implementation.
-    """
+    """Score one already-completed deterministic-evaluation scenario."""
 
     return _check(scenario, response, metrics, duration_ms)
 
