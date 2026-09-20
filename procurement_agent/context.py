@@ -6,10 +6,19 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
-from agent_harness import AgentMiddleware, ModelRequest
+from agent_harness import AgentMiddleware, ModelRequest, ToolRequest
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
 from .business_validation import FIELD_BY_AGENT
+from .test_runtime import current_test_config
+
+SIMULATION_FIELDS = (
+    "simulate_sql_failure",
+    "simulate_subagent_failure",
+    "simulate_mcp_failure",
+    "simulate_execution_failure",
+    "simulate_atomic_failure",
+)
 
 
 def decode(value: Any) -> Any:
@@ -53,6 +62,20 @@ def business_view(value: Any) -> Any:
         else:
             result[key] = business_view(item)
     return result
+
+
+def _without_simulation_fields(value: Any) -> Any:
+    """Remove test-only controls before a HumanMessage reaches a model."""
+
+    if isinstance(value, list):
+        return [_without_simulation_fields(item) for item in value]
+    if isinstance(value, Mapping):
+        return {
+            key: _without_simulation_fields(item)
+            for key, item in value.items()
+            if not (isinstance(key, str) and key.startswith("simulate_"))
+        }
+    return value
 
 
 FIELDS = FIELD_BY_AGENT
@@ -126,18 +149,12 @@ class ProcurementContextMiddleware(AgentMiddleware):
                 continue
             value = decode(item.content)
             source_text = value if isinstance(value, str) else None
-            if isinstance(value, dict) and isinstance(value.get("text"), str):
-                source_text = value["text"]
-                simulation_fields = (
-                    "simulate_sql_failure",
-                    "simulate_subagent_failure",
-                    "simulate_mcp_failure",
-                    "simulate_execution_failure",
-                    "simulate_atomic_failure",
-                )
-                if self.enable_test_config and any(key in value for key in simulation_fields):
+            if isinstance(value, Mapping):
+                if isinstance(value.get("text"), str):
+                    source_text = value["text"]
+                if self.enable_test_config and any(key in value for key in SIMULATION_FIELDS):
                     request.execution.metadata["procurement_test_config"] = {
-                        key: value.get(key, False) for key in simulation_fields
+                        key: value.get(key, False) for key in SIMULATION_FIELDS
                     }
             if source_text and source_text.strip():
                 request.execution.metadata["procurement_source_text"] = source_text
@@ -172,7 +189,9 @@ class ProcurementContextMiddleware(AgentMiddleware):
                     )
             elif isinstance(item, HumanMessage):
                 value = decode(item.content)
-                if isinstance(value, dict):
+                if self.enable_test_config:
+                    value = _without_simulation_fields(value)
+                if isinstance(value, Mapping):
                     item = item.model_copy(
                         update={"content": json.dumps(business_view(value), ensure_ascii=False)}
                     )
@@ -203,3 +222,45 @@ class ProcurementContextMiddleware(AgentMiddleware):
                 )
             )
         request.messages = messages
+
+    def _test_tool_fault(self, request: ToolRequest) -> dict[str, Any] | None:
+        """Apply benchmark-only faults at the real SubAgent Tool boundary."""
+
+        if not self.enable_test_config:
+            return None
+        test_config = current_test_config()
+        if test_config is None:
+            return None
+
+        tool_name = str(getattr(request.tool, "name", ""))
+        if (
+            tool_name == "execute_query"
+            and request.execution.agent_name == "inventory_agent"
+            and test_config.simulate_sql_failure
+            and not test_config.fault_state.get("sql_failure_injected")
+        ):
+            strategy = request.arguments.get("analysis_strategy")
+            strategy = getattr(strategy, "value", strategy)
+            if str(strategy or "") != "schema_recovery":
+                test_config.fault_state["sql_failure_injected"] = True
+                return {
+                    "ok": False,
+                    "operation": "execute_query",
+                    "error": {
+                        "type": "table_not_found",
+                        "message": "A referenced table does not exist.",
+                        "retryable": False,
+                    },
+                }
+
+        if tool_name == "supplier_status" and test_config.simulate_mcp_failure:
+            request.arguments = {**request.arguments, "force_failure": True}
+        return None
+
+    def wrap_tool_call(self, request: ToolRequest, call_next: Any) -> Any:
+        fault = self._test_tool_fault(request)
+        return fault if fault is not None else call_next(request)
+
+    async def awrap_tool_call(self, request: ToolRequest, call_next: Any) -> Any:
+        fault = self._test_tool_fault(request)
+        return fault if fault is not None else await call_next(request)

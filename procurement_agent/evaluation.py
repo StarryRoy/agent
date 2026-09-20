@@ -203,6 +203,8 @@ def _check(
     if "expected_request_quantity" in scenario:
         expected_request["quantity"] = scenario["expected_request_quantity"]
     for field, expected in expected_request.items():
+        if field.startswith("simulate_"):
+            continue
         actual = request.get(field)
         if actual != expected:
             fail(
@@ -337,6 +339,23 @@ def _check(
     return failures, dimensions, invalid_calls
 
 
+def score_scenario(
+    scenario: dict[str, Any],
+    response: Any,
+    metrics: dict[str, Any],
+    duration_ms: float,
+) -> tuple[list[str], dict[str, bool], int]:
+    """Score one already-completed scenario.
+
+    The deterministic evaluation and the real-LLM benchmark intentionally use
+    the same checker.  Keeping this small public wrapper avoids making the
+    benchmark duplicate the evaluation rules while preserving ``_check`` for
+    the existing evaluation implementation.
+    """
+
+    return _check(scenario, response, metrics, duration_ms)
+
+
 def run_evaluation(
     *, scenarios_path: str | Path | None = None, limit: int | None = None
 ) -> EvaluationReport:
@@ -353,6 +372,7 @@ def run_evaluation(
                 data_dir=case_dir,
                 reset_database=True,
                 deterministic=True,
+                enable_test_config=True,
             )
             try:
                 session_id = f"eval-{scenario['id']}"

@@ -20,7 +20,7 @@ from .business_validation import (
     missing_dependencies,
     validate_business_result,
 )
-from .context import DEPENDENCIES, decode, task_view
+from .context import DEPENDENCIES, SIMULATION_FIELDS, decode, task_view
 from .test_runtime import ProcurementTestConfig, use_test_config
 
 
@@ -148,6 +148,7 @@ class ProcurementOrchestrationMiddleware(AgentMiddleware):
 
     def __init__(self, *, enable_test_config: bool = False) -> None:
         self.enable_test_config = enable_test_config
+        self._fault_states: dict[str, dict[str, bool]] = {}
 
     def before_agent(self, execution: Any) -> None:
         # ``execution.input`` contains only this invoke's input before
@@ -269,16 +270,18 @@ class ProcurementOrchestrationMiddleware(AgentMiddleware):
                     continue
                 candidate = decode(message.content)
                 if isinstance(candidate, Mapping):
-                    simulation_fields = (
-                        "simulate_sql_failure",
-                        "simulate_subagent_failure",
-                        "simulate_mcp_failure",
-                        "simulate_execution_failure",
-                        "simulate_atomic_failure",
-                    )
-                    raw = {key: candidate.get(key, False) for key in simulation_fields}
+                    raw = {key: candidate.get(key, False) for key in SIMULATION_FIELDS}
                 break
-        return ProcurementTestConfig.model_validate(raw) if isinstance(raw, Mapping) else None
+        if not isinstance(raw, Mapping):
+            return None
+        session_id = str(request.execution.session_id or "")
+        fault_state = self._fault_states.setdefault(session_id, {})
+        config = ProcurementTestConfig.model_validate(raw)
+        # Pydantic may copy mutable input values during validation.  Assign the
+        # application-owned state after validation so the one-shot real-tool
+        # fault survives separate SubAgent tool invocations in one session.
+        config.fault_state = fault_state
+        return config
 
     def wrap_tool_call(self, request: ToolRequest, call_next: Any) -> Any:
         blocked = request.execution.metadata.get("procurement_blocked_calls", {}).get(

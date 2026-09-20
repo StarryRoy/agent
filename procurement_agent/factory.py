@@ -126,16 +126,20 @@ async def create_procurement_app_async(
     model: BaseChatModel | str | None = None,
     role_models: Mapping[str, BaseChatModel | str] | None = None,
     deterministic: bool = False,
+    enable_test_config: bool | None = None,
 ) -> ProcurementApplication:
     """Create the application.
 
     Real mode defaults to one application-owned DeepSeek model selected from
     environment configuration. Explicit ``model`` and ``role_models`` values
     override that default. The deterministic model is an explicit test double.
+    Fault injection is controlled independently by ``enable_test_config``;
+    omitting it preserves the legacy deterministic-test behavior.
     """
 
     if deterministic and (model is not None or role_models):
         raise ValueError("deterministic test mode cannot be combined with configured LLMs")
+    test_config_enabled = deterministic if enable_test_config is None else enable_test_config
 
     configured_roles = dict(role_models or {})
     default_model = model
@@ -253,7 +257,15 @@ async def create_procurement_app_async(
             )
         if role == "supplier":
             role_tools.extend(mcp_tools)
-        agent_middleware = [ProcurementContextMiddleware()]
+        # The deterministic model and services already implement the test
+        # faults themselves.  Keep the extra real-tool boundary injector out
+        # of that path so deterministic behavior remains unchanged; real LLM
+        # runs opt into it through the independent test-config flag below.
+        agent_middleware = [
+            ProcurementContextMiddleware(
+                enable_test_config=test_config_enabled and not deterministic
+            )
+        ]
         if role == "execution":
             agent_middleware.append(ExecutionToolInputMiddleware())
         subagents.append(
@@ -306,8 +318,8 @@ async def create_procurement_app_async(
         state_schema=ProcurementState,
         runtime_config=main_config,
         middleware=[
-            ProcurementContextMiddleware(enable_test_config=deterministic),
-            ProcurementOrchestrationMiddleware(enable_test_config=deterministic),
+            ProcurementContextMiddleware(enable_test_config=test_config_enabled),
+            ProcurementOrchestrationMiddleware(enable_test_config=test_config_enabled),
         ],
         checkpointer=checkpointer,
         event_sinks=sinks,

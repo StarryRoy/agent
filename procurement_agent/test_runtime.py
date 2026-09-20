@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class ProcurementTestConfig(BaseModel):
-    """Strict fault-injection controls available only in deterministic runtime."""
+    """Strict fault-injection controls for explicitly enabled test runs."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -22,6 +22,7 @@ class ProcurementTestConfig(BaseModel):
     simulate_mcp_failure: bool = Field(..., description="测试用 MCP 失败开关。")
     simulate_execution_failure: bool = Field(..., description="测试用执行前失败开关。")
     simulate_atomic_failure: bool = Field(..., description="测试用事务回滚开关。")
+    fault_state: dict[str, bool] = Field(default_factory=dict, exclude=True, repr=False)
 
 
 _TEST_CONFIG: ContextVar[ProcurementTestConfig | None] = ContextVar(

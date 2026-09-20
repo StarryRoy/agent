@@ -173,14 +173,24 @@ Trace 读取直接利用现有 JSONL 文件，适合本地演示；长期大量�
 
 ### 真实 LLM Benchmark
 
-完成模型服务配置后，一条命令会执行固定采购场景并生成可追溯的 JSON、CSV、Markdown 报告以及
-逐场景 JSONL Trace：
+完成模型服务配置后，推荐使用下面的一键入口执行 `evals/scenarios.json` 中的全部场景。每个
+场景使用独立 session，场景声明的 approve / reject / modify 会自动执行，评分只在场景结束后
+进行：
 
 ```powershell
-.\.venv\Scripts\python.exe benchmark/run.py
+.\.venv\Scripts\python.exe main.py benchmark
 ```
 
-结果写入 `benchmark/results/`，可读报告写入 `benchmark/reports/`。使用
+终端只输出汇总，完整结果写入 `data/benchmark_result.json`，包括逐场景响应、评分维度、路由、
+调用次数、耗时和真实模型 Token usage。`expected_*` 字段不会传入 Agent。也可以在命令前使用
+现有的 `--model` 参数覆盖默认模型：
+
+```powershell
+.\.venv\Scripts\python.exe main.py --model provider:model-name benchmark
+```
+
+项目中保留了 `benchmark/run.py` 作为生成 JSON、CSV、Markdown 和逐场景 Trace 的扩展报告工具。
+如果使用它，结果写入 `benchmark/results/`，可读报告写入 `benchmark/reports/`。使用
 `--label before` 和 `--label after` 保存两个版本的基准数据；当两份数据同时存在时，后续报告
 会自动增加 Before / After 对比。`--role-model role=provider:model` 继续复用工厂现有的
 `role_models` 配置。`--deterministic` 仅用于调试评测模块，生成结果会明确标记为非真实 LLM，
@@ -191,9 +201,10 @@ Trace 读取直接利用现有 JSONL 文件，适合本地演示；长期大量�
 .\.venv\Scripts\python.exe benchmark/run.py --label after
 ```
 
-每项 Token 和耗时均直接来自 Harness Trace。模型供应商未返回的指标显示为 `N/A`，不会估算。
-所有场景默认固定使用 `2026-09-11` 作为业务日期，并在报告中记录日期与 Git commit；可通过
-`--benchmark-date YYYY-MM-DD` 或 `PROCUREMENT_BENCHMARK_DATE` 覆盖。Before / After 仅在模型、
+`benchmark/run.py` 的扩展报告默认固定使用 `2026-09-11` 作为业务日期，并在报告中记录日期与
+Git commit；可通过 `--benchmark-date YYYY-MM-DD` 或 `PROCUREMENT_BENCHMARK_DATE` 覆盖。
+每项 Token 和耗时均直接来自 Harness Trace 或模型返回的 usage。模型供应商未返回的指标显示为
+`N/A`，不会估算。Before / After 仅在模型、
 角色模型、业务日期、MCP 开关和场景集合一致时生成正式对比。
 
 ### CLI / Python

@@ -309,3 +309,38 @@ def test_production_context_does_not_enable_fault_injection_metadata():
     ProcurementContextMiddleware().before_model(request)
 
     assert "procurement_test_config" not in execution.metadata
+
+
+def test_enabled_context_hides_all_simulation_fields_from_model_messages():
+    execution = AgentExecution("main", {}, session_id="benchmark-context")
+    message = HumanMessage(
+        content=json.dumps(
+            {
+                "text": "采购500台设备",
+                "simulate_sql_failure": True,
+                "simulate_subagent_failure": "supplier",
+                "simulate_mcp_failure": False,
+                "simulate_execution_failure": False,
+                "simulate_atomic_failure": False,
+                "nested": {"simulate_unknown_failure": True, "department": "IT"},
+            },
+            ensure_ascii=False,
+        )
+    )
+    request = ModelRequest(execution, {"messages": [message]}, [message], {})
+
+    ProcurementContextMiddleware(enable_test_config=True).before_model(request)
+
+    visible = json.loads(request.messages[0].content)
+    assert visible == {
+        "text": "采购500台设备",
+        "nested": {"department": "IT"},
+    }
+    assert "simulate_" not in json.dumps(visible, ensure_ascii=False)
+    assert execution.metadata["procurement_test_config"] == {
+        "simulate_sql_failure": True,
+        "simulate_subagent_failure": "supplier",
+        "simulate_mcp_failure": False,
+        "simulate_execution_failure": False,
+        "simulate_atomic_failure": False,
+    }

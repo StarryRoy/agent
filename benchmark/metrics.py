@@ -55,10 +55,10 @@ def collect_metrics(events: list[dict[str, Any]]) -> dict[str, Any]:
             output_value = None
         if isinstance(total_value, (int, float)):
             total_tokens.append(int(total_value))
-        elif input_value is not None and output_value is not None:
-            total_tokens.append(int(input_value + output_value))
-            total_value = int(input_value + output_value)
         else:
+            # Do not manufacture a total from input/output counts.  A
+            # benchmark report may aggregate provider-reported totals only;
+            # missing usage remains unavailable.
             total_value = None
         contexts.append(
             {

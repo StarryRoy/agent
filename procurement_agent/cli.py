@@ -57,6 +57,7 @@ def _parser() -> argparse.ArgumentParser:
     subparsers.add_parser("metrics", help="显示当前进程累计指标")
     evaluate = subparsers.add_parser("eval", help="运行固定业务回归评测集")
     evaluate.add_argument("--limit", type=int, default=None)
+    subparsers.add_parser("benchmark", help="使用真实 LLM 运行固定 Benchmark 并保存 JSON")
     return parser
 
 
@@ -67,6 +68,28 @@ def main(argv: list[str] | None = None) -> int:
 
         try:
             _print(run_evaluation(limit=args.limit).as_dict())
+            return 0
+        except Exception as exc:  # noqa: BLE001 - CLI owns the final error boundary
+            _print({"status": "error", "error_type": type(exc).__name__, "message": str(exc)})
+            return 1
+    if args.command == "benchmark":
+        from .benchmark import run_benchmark
+
+        try:
+            report = run_benchmark(model=args.model)
+            summary = report["summary"]
+
+            def percentage(value: Any) -> str:
+                return f"{float(value) * 100:.2f}%"
+
+            print("Benchmark completed")
+            print(f"Scenarios: {summary['scenario_count']}")
+            print(f"Task Completion: {percentage(summary['task_completion_rate'])}")
+            print(f"Routing Accuracy: {percentage(summary['routing_accuracy'])}")
+            print(f"Final Plan Accuracy: {percentage(summary['final_plan_accuracy'])}")
+            print(f"Average Tokens: {summary['average_tokens']:.2f}")
+            print(f"Average Duration: {summary['average_duration_ms']:.2f} ms")
+            print("Result saved to: data/benchmark_result.json")
             return 0
         except Exception as exc:  # noqa: BLE001 - CLI owns the final error boundary
             _print({"status": "error", "error_type": type(exc).__name__, "message": str(exc)})

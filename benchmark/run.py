@@ -127,6 +127,7 @@ def _run_scenario(config: BenchmarkConfig, scenario: Scenario, run_id: str) -> d
                 model=config.model,
                 role_models=config.role_models or None,
                 deterministic=config.deterministic,
+                enable_test_config=True,
                 today=config.benchmark_date,
             )
             for statement in scenario.setup_sql:
